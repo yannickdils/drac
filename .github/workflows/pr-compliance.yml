@@ -1,0 +1,442 @@
+# ============================================================
+# DRaaC — Disaster Recovery as Code
+# GitHub Actions PR Compliance Workflow
+#
+# Mirrors .azure/pipelines/pr-compliance.yml exactly.
+# All six stages use the same shared scripts/ directory.
+# Only differences from Azure DevOps:
+#   - Auth:      azure/login@v2 (OIDC) instead of AzureCLI@2 task
+#   - Artifacts: actions/upload-artifact@v4 instead of ADO publish
+#   - PR comment: gh CLI instead of ADO REST API
+#   - Secrets:   GitHub repository/environment secrets
+#   - Commit:    GITHUB_TOKEN instead of System.AccessToken
+#
+# Required repository secrets:
+#   AZURE_CLIENT_ID          — App Registration client ID (OIDC)
+#   AZURE_TENANT_ID          — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID    — Primary subscription (for CLI context)
+#   AZURE_SUBSCRIPTION_IDS   — Comma-separated list, or ALL
+#   MANAGEMENT_GROUP_ID      — Optional; overrides subscription list
+#   DR_TARGET_REGION         — e.g. northeurope
+#   DR_VNET_ADDRESS_PREFIX   — e.g. 10.1.0.0/16
+#   DR_SUBNET_ADDRESS_PREFIX — e.g. 10.1.0.0/24
+#   DR_NAMING_PREFIX         — e.g. dr-  (optional, defaults to dr-)
+#
+# Required permissions (set at repo or environment level):
+#   id-token: write      — OIDC token for Azure login
+#   contents: write      — commit CONFIGURATION-DRIFT.md to PR branch
+#   pull-requests: write — post PR comment
+# ============================================================
+
+name: "DRaaC PR Compliance"
+
+on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - "docs/**"
+      - "*.md"
+      - ".gitignore"
+
+# Cancel in-progress runs for the same PR on new pushes
+concurrency:
+  group: "draac-${{ github.event.pull_request.number }}"
+  cancel-in-progress: true
+
+env:
+  AZURE_RESOURCE_GRAPH_API_VERSION: "2024-04-01"
+  AZURE_ARM_API_VERSION: "2021-04-01"
+  OUTPUT_DIR: "${{ github.workspace }}/_reports"
+  RUN_ID: "${{ github.run_id }}"
+  PR_ID: "${{ github.event.pull_request.number }}"
+  PR_SOURCE_BRANCH: "${{ github.head_ref }}"
+  DR_NAMING_PREFIX: "${{ secrets.DR_NAMING_PREFIX || 'dr-' }}"
+
+jobs:
+
+  # ── Job 1: Scan Azure Subscriptions ─────────────────────────────────────────
+  scan:
+    name: "1 · Scan Azure Subscriptions"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      scan-complete: ${{ steps.scan.outputs.complete }}
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install tooling
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            az extension add --name resource-graph --upgrade -y
+            if ($IsLinux) { sudo apt-get install -qq -y jq }
+
+      - name: Scan — enumerate subscriptions & export resources
+        id: scan
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/scan/scan-subscriptions.ps1 \
+              -ApiVersion "${{ env.AZURE_RESOURCE_GRAPH_API_VERSION }}" \
+              -SubscriptionIds "${{ secrets.AZURE_SUBSCRIPTION_IDS }}" \
+              -ManagementGroup "${{ secrets.MANAGEMENT_GROUP_ID || 'none' }}" \
+              -OutputDir "${{ env.OUTPUT_DIR }}" \
+              -RunId "${{ env.RUN_ID }}"
+            echo "complete=true" >> $GITHUB_OUTPUT
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+      - name: Upload scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: ${{ env.OUTPUT_DIR }}/scan
+          retention-days: 7
+
+  # ── Job 2: Export & Document Environment ─────────────────────────────────────
+  export:
+    name: "2 · Export & Document Environment"
+    runs-on: ubuntu-latest
+    needs: scan
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: scan-results
+          path: ${{ env.OUTPUT_DIR }}/scan
+
+      - name: Export ARM templates per resource group
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/export/export-arm-templates.ps1 \
+              -ScanDir "${{ env.OUTPUT_DIR }}/scan" \
+              -ArmApiVersion "${{ env.AZURE_ARM_API_VERSION }}" \
+              -OutputDir "${{ env.OUTPUT_DIR }}/export" \
+              -RunId "${{ env.RUN_ID }}"
+
+      - name: Generate environment documentation
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/export/generate-env-docs.ps1 \
+              -ExportDir "${{ env.OUTPUT_DIR }}/export" \
+              -OutputDir "${{ env.OUTPUT_DIR }}/docs" \
+              -RunId "${{ env.RUN_ID }}"
+
+      - name: Upload export results
+        uses: actions/upload-artifact@v4
+        with:
+          name: export-results
+          path: ${{ env.OUTPUT_DIR }}/export
+          retention-days: 7
+
+      - name: Upload environment docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: env-docs
+          path: ${{ env.OUTPUT_DIR }}/docs
+          retention-days: 7
+
+  # ── Job 3: Review Code vs Deployed ───────────────────────────────────────────
+  review:
+    name: "3 · Review Code vs Deployed State"
+    runs-on: ubuntu-latest
+    needs: export
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download scan results
+        uses: actions/download-artifact@v4
+        with:
+          name: scan-results
+          path: ${{ env.OUTPUT_DIR }}/scan
+
+      - name: Download export results
+        uses: actions/download-artifact@v4
+        with:
+          name: export-results
+          path: ${{ env.OUTPUT_DIR }}/export
+
+      - name: Identify changed files in PR
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/review/identify-pr-changes.ps1 \
+              -BaseCommit "${{ github.base_ref }}" \
+              -HeadCommit "${{ github.sha }}" \
+              -OutputDir "${{ env.OUTPUT_DIR }}/review"
+
+      - name: Match changed code files to Azure deployments
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/review/match-code-to-deployed.ps1 \
+              -PrChangesFile "${{ env.OUTPUT_DIR }}/review/pr-changes.json" \
+              -ScanDir "${{ env.OUTPUT_DIR }}/scan" \
+              -ExportDir "${{ env.OUTPUT_DIR }}/export" \
+              -OutputDir "${{ env.OUTPUT_DIR }}/review" \
+              -RunId "${{ env.RUN_ID }}"
+
+      - name: Upload review results
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-results
+          path: ${{ env.OUTPUT_DIR }}/review
+          retention-days: 7
+
+  # ── Job 4: Drift Detection ────────────────────────────────────────────────────
+  drift:
+    name: "4 · Configuration Drift Detection"
+    runs-on: ubuntu-latest
+    needs: review
+    permissions:
+      id-token: write
+      contents: write      # Required to commit CONFIGURATION-DRIFT.md
+      pull-requests: read
+
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Use a token with write access for the commit-back step
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-results"
+          merge-multiple: false
+          path: ${{ env.OUTPUT_DIR }}
+
+      - name: Run drift analysis
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/drift/detect-drift.ps1 \
+              -ScanDir "${{ env.OUTPUT_DIR }}/scan-results" \
+              -ExportDir "${{ env.OUTPUT_DIR }}/export-results" \
+              -ReviewDir "${{ env.OUTPUT_DIR }}/review-results" \
+              -RepoRoot "${{ github.workspace }}" \
+              -OutputDir "${{ env.OUTPUT_DIR }}/drift" \
+              -RunId "${{ env.RUN_ID }}" \
+              -PrId "${{ env.PR_ID }}" \
+              -PrSourceBranch "${{ env.PR_SOURCE_BRANCH }}"
+
+      - name: Update CONFIGURATION-DRIFT.md
+        shell: pwsh
+        run: |
+          scripts/drift/update-drift-readme.ps1 \
+            -DriftReportPath "${{ env.OUTPUT_DIR }}/drift/drift-report.json" \
+            -RepoRoot "${{ github.workspace }}" \
+            -RunId "${{ env.RUN_ID }}" \
+            -PrId "${{ env.PR_ID }}" \
+            -SourceBranch "${{ env.PR_SOURCE_BRANCH }}"
+
+      - name: Commit CONFIGURATION-DRIFT.md to PR branch
+        run: |
+          pwsh scripts/drift/commit-drift-readme.ps1 \
+            -RepoRoot "${{ github.workspace }}" \
+            -PrBranch "${{ env.PR_SOURCE_BRANCH }}" \
+            -RunId "${{ env.RUN_ID }}"
+        env:
+          # GitHub Actions uses GITHUB_TOKEN for git push auth
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIT_AUTHOR_NAME: "DRaaC Pipeline"
+          GIT_AUTHOR_EMAIL: "draac-pipeline@github-actions.local"
+          GIT_COMMITTER_NAME: "DRaaC Pipeline"
+          GIT_COMMITTER_EMAIL: "draac-pipeline@github-actions.local"
+
+      - name: Upload drift results
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-results
+          path: ${{ env.OUTPUT_DIR }}/drift
+          retention-days: 7
+
+  # ── Job 5: DR Configuration Generation ───────────────────────────────────────
+  disaster-recovery:
+    name: "5 · Generate DR Configuration"
+    runs-on: ubuntu-latest
+    needs: export       # Runs in parallel with review/drift — needs export only
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            az bicep install
+            az bicep upgrade
+            az bicep version
+
+      - name: Download export results
+        uses: actions/download-artifact@v4
+        with:
+          name: export-results
+          path: ${{ env.OUTPUT_DIR }}/export
+
+      - name: Generate DR Bicep files (region-adapted)
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/dr/generate-dr-config.ps1 \
+              -ExportDir "${{ env.OUTPUT_DIR }}/export" \
+              -OutputDir "${{ env.OUTPUT_DIR }}/dr" \
+              -DrRegion "${{ secrets.DR_TARGET_REGION }}" \
+              -DrVnetPrefix "${{ secrets.DR_VNET_ADDRESS_PREFIX }}" \
+              -DrSubnetPrefix "${{ secrets.DR_SUBNET_ADDRESS_PREFIX }}" \
+              -DrNamingPrefix "${{ env.DR_NAMING_PREFIX }}" \
+              -RunId "${{ env.RUN_ID }}"
+
+      - name: Validate DR Bicep (what-if)
+        uses: azure/cli@v2
+        continue-on-error: true    # Validation failures are reported, not fatal
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/dr/validate-dr-config.ps1 \
+              -DrDir "${{ env.OUTPUT_DIR }}/dr" \
+              -DrRegion "${{ secrets.DR_TARGET_REGION }}" \
+              -RunId "${{ env.RUN_ID }}"
+
+      - name: Upload DR configuration
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-config
+          path: ${{ env.OUTPUT_DIR }}/dr
+          retention-days: 30       # Keep DR templates longer than other artifacts
+
+  # ── Job 6: Final Report & PR Comment ─────────────────────────────────────────
+  report:
+    name: "6 · Final Report & PR Annotation"
+    runs-on: ubuntu-latest
+    needs: [review, drift, disaster-recovery]
+    if: always()    # Run even if upstream jobs failed — always post a report
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write   # Required to post/update PR comment
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-results"
+          merge-multiple: false
+          path: ${{ env.OUTPUT_DIR }}
+
+      - name: Download DR config artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dr-config
+          path: ${{ env.OUTPUT_DIR }}/dr-config
+        continue-on-error: true
+
+      - name: Build summary and post PR comment
+        shell: pwsh
+        run: |
+          scripts/report/post-pr-comment-github.ps1 `
+            -ScanDir "${{ env.OUTPUT_DIR }}/scan-results" `
+            -ReviewDir "${{ env.OUTPUT_DIR }}/review-results" `
+            -DriftDir "${{ env.OUTPUT_DIR }}/drift-results" `
+            -DrDir "${{ env.OUTPUT_DIR }}/dr-config" `
+            -RunId "${{ env.RUN_ID }}" `
+            -PrId "${{ env.PR_ID }}" `
+            -RepoOwner "${{ github.repository_owner }}" `
+            -RepoName "${{ github.event.repository.name }}" `
+            -RunUrl "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Write GitHub Actions job summary
+        shell: pwsh
+        run: |
+          scripts/report/write-job-summary.ps1 `
+            -ScanDir "${{ env.OUTPUT_DIR }}/scan-results" `
+            -ReviewDir "${{ env.OUTPUT_DIR }}/review-results" `
+            -DriftDir "${{ env.OUTPUT_DIR }}/drift-results" `
+            -DrDir "${{ env.OUTPUT_DIR }}/dr-config" `
+            -SummaryFile "${{ env.GITHUB_STEP_SUMMARY }}"
+        continue-on-error: true

@@ -1,0 +1,17 @@
+# Pipeline outputs — never committed
+reports/
+*.zip
+
+# Local Azure CLI cache
+.azure/
+
+# Exported ARM/Bicep (generated artefacts — published via pipeline artifacts)
+export-results/
+scan-results/
+dr-config/
+
+# Temp files
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
