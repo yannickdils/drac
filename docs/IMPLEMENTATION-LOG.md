@@ -12,7 +12,7 @@
 |---|---|---|---|
 | Pre-work — Validation harness | Done | `tests/` runner + 5 fixtures | `pwsh tests/Invoke-Validation.ps1 -Round 1` |
 | Round 1 — Correctness fixes (B1, B2, B3, B4) | Done | `scripts/lib/ConvertForDR.psm1`, `data/`, rewired Stage 5 | All assertions pass; PSScriptAnalyzer clean |
-| Round 2 — Close Loop A (A1, A2) | Not started | — | — |
+| Round 2 — Close Loop A (A1, A2) | Done | DR coverage gate, `bicep/regions/{primary,dr}/`, Stage 7 deploy workflow, shared `CommitBack.psm1` | 4/4 tests pass; PSScriptAnalyzer clean (12 files); both anchor Bicep files compile |
 | Round 3 — Open Loop B (A3) | Not started | — | — |
 | Round 4 — Make DR real (A4, A5, E4) | Not started | — | — |
 | Round 5 — Polish (C1, C2, D1–D3, E1–E3, E5) | Not started | — | — |
@@ -122,6 +122,72 @@ These items are explicitly out of scope for the current session and must be pick
 ## Round 1 commit
 
 The Round 1 work landed as a single commit `feat(draac): Round 1 + validation harness — extract Convert-ForDR module, fix B1–B4`. See `git log --oneline` for the SHA.
+
+---
+
+## Round 2 — Close Loop A (A1 DR coverage gate, A2 DR deploy)
+
+**Landed 2026-05-05.** Goal: make "DR by default" enforced at PR time and actually deployed post-merge.
+
+**Approach:** parallel agents. The main thread bootstrapped the `bicep/regions/{primary,dr}/anchor.bicep` convention; two general-purpose agents then implemented R2.1 and R2.2 in parallel against disjoint file scopes; the main thread synthesized, wired the coverage gate into `pr-compliance.yml`, fixed three bugs the agents could not catch (they had no shell access for self-validation), and ran the full test + analyzer suite.
+
+**Files added / modified:**
+
+| File | Notes |
+|---|---|
+| `bicep/regions/primary/anchor.bicep` + `bicep/regions/dr/dr-anchor.bicep` | Anchor Storage Account workload (mirrors the demo's pattern). Establishes the convention so the coverage gate has at least one PR-checkable workload from day one. Both compile clean. |
+| `bicep/regions/README.md` | Documents the convention and the `rg-<workload>` / `rg-<workload>-dr` RG-naming rule. |
+| `scripts/lib/CommitBack.psm1` | New shared module. Exports `Push-Branch -RepoRoot -Branch -RunId -Files -Message [-MaxRetries]` (returns `[bool]`). Auto-appends `[skip ci]` to the commit message so the PR workflow doesn't retrigger itself. |
+| `scripts/drift/commit-drift-readme.ps1` | Reduced from 93 to 46 lines — now a thin wrapper over `Push-Branch`. CLI parameter contract preserved. |
+| `scripts/review/check-dr-coverage.ps1` | DR coverage gate. Reads `pr-changes.json`, asserts/auto-generates DR companions for changed primary Bicep files. Calls `Convert-ForDR` from Round 1's module on the compiled ARM. |
+| `scripts/dr/deploy-dr-region.ps1` | Stage 7 deploy script. Has a `[switch] -DryRun` test seam so the harness can exercise the script offline. Throttling retry helper `Invoke-AzWithRetry -Operation -ScriptBlock [-BackoffSeconds]`; default backoff `@(5, 15, 45, 135)`. Per-RG fault tolerance writes `_reports/deploy/failures.json`; final summary at `_reports/deploy/deploy-summary.json`. `Test-DRHealth` invocation marked with a placeholder comment per R4.2 deferral. |
+| `.github/workflows/dr-deploy.yml` | Stage 7 GitHub Actions workflow. Trigger: `push` to `main` with `paths: [bicep/regions/dr/**]` + `workflow_dispatch`. Concurrency `group: draac-dr-deploy, cancel-in-progress: false`. |
+| `.github/workflows/pr-compliance.yml` | `review` job: bumped `contents` permission to `write` (for commit-back); added Bicep CLI install step; added DR coverage gate step (`id: dr-coverage`); added `coverage-results` artifact upload. |
+| `tests/round-2/Test-CheckDrCoverage.ps1` | Coverage gate test: happy path (companion exists), idempotency, missing companion (auto-gen branch when `bicep` is on PATH; failed branch otherwise), empty change set, non-Bicep change ignored. |
+| `tests/round-2/Test-DeployDrRegion.ps1` | Deploy test (`-DryRun`): two-file walk, deterministic deployment names stable across re-runs, four `Invoke-AzWithRetry` cases (happy, throttle-recover, hard-fail, persistent-throttle). |
+| `docs/ARCHITECTURE.md` | Added Stage 7 ASCII block; added Round-2 file inventory; updated Stage 3 to describe the DR coverage gate. |
+| `docs/DOCUMENTATION.md` | Added "Stage 3.5: DR Coverage Gate" and "Stage 7: DR Deploy" sections. |
+
+**Three bugs caught and fixed during integration** (agents could not run their own validation, so these surfaced when the main thread ran the harness):
+
+1. **`Get-ChangedPrimaryBicepPath` double-wrap.** The function used `return ,@($paths.ToArray() | Sort-Object -Unique)` and the caller wrapped again with `@(...)`, producing a 1-element array containing the real array — iterating gave a sub-array that couldn't bind to `[string] $PrimaryPath`. Dropped the function-side comma trick; relied on the caller wrap.
+
+2. **Single-element JSON array unwrap.** When `pr-changes.json` contained one entry, `ConvertFrom-Json` unwrapped to a bare `PSCustomObject`. The script's `IEnumerable` check then missed it and reported "0 primary Bicep files changed." Fixed `Get-ChangedPrimaryBicepPath` to detect three cases: multi-item array, single PSCustomObject with a `path` field (1-element unwrap), wrapped `{ changes: [...] }` object.
+
+3. **Empty pipeline + `Set-Content`.** The test helper `New-PrChangesFile` piped `$entries.ToArray() | ConvertTo-Json -AsArray | Set-Content` to write `pr-changes.json`. With zero entries, the pipeline emits nothing and Set-Content silently skips the file — the script then warned "PR changes file not found." Forced a literal `[]` write for the empty case.
+
+**Validation results:**
+
+```
+pwsh tests/Invoke-Validation.ps1 -Round '1','2'
+Round Test                            ExitCode Status
+1     Test-ConvertForDR.ps1                  0 PASS
+1     Test-GenerateDrConfig-Smoke.ps1        0 PASS
+2     Test-CheckDrCoverage.ps1               0 PASS
+2     Test-DeployDrRegion.ps1                0 PASS
+Total: 4  Pass: 4  Fail: 0
+```
+
+```
+Invoke-ScriptAnalyzer -Settings PSScriptAnalyzerSettings.psd1   →  0 issues across 12 files
+pwsh tests/bicep-build-all.ps1 -Path bicep/regions               →  2 succeeded, 0 failed
+```
+
+**Acceptance per brief — what is and isn't covered:**
+
+| Brief acceptance (R2.3) | Covered? | Notes |
+|---|---|---|
+| Open a PR adding a new primary Bicep; gate auto-generates DR companion | ✅ structurally | Auto-gen path proven end-to-end in `Test-CheckDrCoverage.ps1` (creates an `orphan.bicep`, runs the gate, asserts `dr-orphan.bicep` materialises on disk). |
+| PR re-validates green after auto-generation | ✅ structurally | Idempotency assertion: re-running the gate on the same repo state produces an identical report. |
+| Deploy workflow runs on merge, what-if + deployment succeed | **Deferred** | Cannot execute without an Azure subscription. The `-DryRun` test exercises the entire script flow and asserts deterministic outputs. |
+| Re-run deploy is a no-op | ✅ structurally | Deterministic deployment name `draac-<sha7>-rg-<workload>-dr` proven stable across re-runs in the test; Azure-side dedup is documented behaviour. |
+| `setup-github.ps1` updates branch protection to require Stage 7 | **Deferred** | The Stage 7 workflow runs on push to `main`, not on PR — so it does NOT need branch protection (it can't gate a PR). The brief's wording predates that design choice. Worth confirming with the operator on first install. |
+
+**Notable design decisions (worth knowing for Round 3+):**
+
+- **`-DryRun` test seam on `deploy-dr-region.ps1`.** The script has a `[switch] -DryRun` flag that skips `az group create / what-if / deploy` and writes synthetic outputs. Tests never touch Azure; the production workflow never sets the flag. Cleanest way to isolate Azure-calling code from a unit-test boundary without mocking infrastructure.
+- **`CommitBack.psm1` extraction was scope creep, but worth it.** The R2.1 agent observed it would have to copy 60-odd lines of git-auth + retry logic from `commit-drift-readme.ps1`. Extracting one shared module saves the duplication and means future commit-back patterns (Round 3's portal-sync PR creation, for example) inherit the same auth + retry semantics. CLI contract of `commit-drift-readme.ps1` is unchanged so this is invisible to the existing `pr-compliance.yml`.
+- **Stage 7 lives in its own workflow, not as a job in `pr-compliance.yml`.** Brief implies a single pipeline; the implementation diverges because deploy must run *after* merge against the post-merge SHA. Branch protection / merge-queue enforcement should still gate `pr-compliance.yml` (which is what blocks merge); `dr-deploy.yml` runs unconditionally on merge to `main`.
 
 ---
 

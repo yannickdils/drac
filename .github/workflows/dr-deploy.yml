@@ -1,0 +1,88 @@
+# ============================================================
+# DRaaC — Disaster Recovery as Code
+# Stage 7 (Round 2.2): DR Region Deploy
+#
+# Triggers on push to main when bicep/regions/dr/** changes, plus
+# workflow_dispatch for manual re-runs. Deploys every dr-<workload>.bicep
+# under bicep/regions/dr/ to its conventional resource group rg-<workload>-dr
+# in $DR_TARGET_REGION using the deterministic deployment name
+# `draac-<sha7>-rg-<workload>-dr`. Re-runs at the same commit SHA are no-ops
+# at the Azure side.
+#
+# Required repository secrets (re-uses what pr-compliance.yml already needs):
+#   AZURE_CLIENT_ID          — App Registration client ID (OIDC)
+#   AZURE_TENANT_ID          — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID    — Target subscription for DR deployments
+#   DR_TARGET_REGION         — e.g. northeurope
+# ============================================================
+
+name: "DRaaC DR Deploy"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "bicep/regions/dr/**"
+  workflow_dispatch: {}
+
+# Serialise deploys: a deterministic deployment name plus a single in-flight
+# run prevents race conditions on rg-<workload>-dr.
+concurrency:
+  group: "draac-dr-deploy"
+  cancel-in-progress: false
+
+env:
+  OUTPUT_DIR: "${{ github.workspace }}/_reports"
+  RUN_ID: "${{ github.run_id }}"
+  COMMIT_SHA: "${{ github.sha }}"
+
+jobs:
+
+  # ── Stage 7: DR Deploy ──────────────────────────────────────────────────────
+  deploy:
+    name: "7 · Deploy DR Region"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install Bicep CLI
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            az bicep install
+            az bicep upgrade
+            az bicep version
+
+      - name: Deploy DR Bicep templates
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/dr/deploy-dr-region.ps1 \
+              -BicepDir "${{ github.workspace }}/bicep/regions/dr" \
+              -DrRegion "${{ secrets.DR_TARGET_REGION }}" \
+              -CommitSha "${{ env.COMMIT_SHA }}" \
+              -RunId "${{ env.RUN_ID }}" \
+              -OutputDir "${{ env.OUTPUT_DIR }}/deploy"
+
+      - name: Upload deploy reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dr-deploy-reports
+          path: ${{ env.OUTPUT_DIR }}/deploy
+          retention-days: 30

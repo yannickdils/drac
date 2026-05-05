@@ -2,7 +2,7 @@
 
 > **Version:** 1.0.0
 > **API Versions:** Resource Graph `2024-04-01` · ARM `2021-04-01` · ADO REST `7.1`
-> **Last Updated:** 2026-05-04
+> **Last Updated:** 2026-05-05
 
 ---
 
@@ -228,6 +228,69 @@ In Azure DevOps → Repos → Branches → `main` → Branch policies:
   ```powershell
   pwsh tests/Invoke-Validation.ps1 -Round 1
   ```
+
+---
+
+### Stage 3.5: DR Coverage Gate (Round 2 §R2.1)
+
+**What it does:** Inside the existing `review` job of `pr-compliance.yml`, a new step asserts that every PR-changed file under `bicep/regions/primary/` has a matching `bicep/regions/dr/dr-<workload>.bicep` companion. When missing, the gate auto-generates the companion (`bicep build` → `Convert-ForDR` → `bicep decompile`) and commits it back to the PR branch.
+
+**Script:** `scripts/review/check-dr-coverage.ps1`
+
+**Convention** (operator-authored — see `bicep/regions/README.md`):
+
+```
+bicep/regions/
+├── primary/<workload>.bicep    ← you author this
+└── dr/dr-<workload>.bicep      ← gate auto-generates this when missing
+```
+
+**Outputs:**
+
+| Item | Where |
+|---|---|
+| Per-file coverage report | `_reports/coverage/coverage-report.json` |
+| GitHub Actions output | `DR_COVERAGE_OK=true|false` (consumable by downstream jobs) |
+| Commit-back | Auto-generated companions pushed to PR branch as `chore(draac): auto-generate DR companions [skip ci]` |
+
+**Coverage states per primary file:**
+
+| State | Meaning | Gate result |
+|---|---|---|
+| `ok` | DR companion already in repo | pass |
+| `auto-generated` | Companion missing; gate generated & committed it | pass (re-validates green on next push) |
+| `failed` | Auto-generation failed (e.g. Bicep decompile dirty) | **block** — exits non-zero; reviewer must hand-author the companion |
+
+**Adding a new workload:** Drop a new `bicep/regions/primary/<workload>.bicep` in your PR. The gate auto-generates `dr/dr-<workload>.bicep` on first push; review the diff and merge.
+
+---
+
+### Stage 7: DR Deploy (Round 2 §R2.2)
+
+**What it does:** On push to `main` whose changes touch `bicep/regions/dr/**`, this workflow deploys every `dr-*.bicep` to its conventional resource group in the DR region.
+
+**Workflow:** `.github/workflows/dr-deploy.yml`
+**Script:** `scripts/dr/deploy-dr-region.ps1`
+
+**Behaviours:**
+
+- **Resource group convention:** `dr/dr-<workload>.bicep` deploys to RG `rg-<workload>-dr` in `$DR_TARGET_REGION`. The script `az group create`s it idempotently before deploying.
+- **Deterministic deployment name:** `draac-<sha7>-rg-<workload>-dr`. Re-running the workflow at the same commit SHA against the same template is a no-op at the Azure level (Azure deduplicates by deployment name within an RG).
+- **What-if first:** Each file gets a what-if pass (`_reports/deploy/whatif-rg-<workload>-dr.json`) before the actual deployment.
+- **Throttling retry:** Detects `429`/`ThrottlingException`/`TooManyRequests`; exponential backoff `5s → 15s → 45s → 135s` before failing the file.
+- **Per-RG fault tolerance:** A single file's failure does not abort the run. Failures land in `_reports/deploy/failures.json`; the run summary at `_reports/deploy/deploy-summary.json` lists what succeeded and what didn't.
+- **Concurrency:** `group: draac-dr-deploy, cancel-in-progress: false` — never cancels an in-flight deploy.
+
+**Required secrets** (already required by `pr-compliance.yml` — no new secrets):
+
+| Secret | Purpose |
+|---|---|
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | OIDC federated auth |
+| `DR_TARGET_REGION` | DR region (e.g. `northeurope`) |
+
+**Manual re-run:** Trigger via the Actions tab → "DRaaC DR Deploy" → "Run workflow". Useful for re-deploying without a code change (e.g. after manually deleting an RG).
+
+**Test-DRHealth invocation point:** A comment placeholder in `deploy-dr-region.ps1` marks where the post-deploy health check will hook in once Round 4 §R4.2 is implemented.
 
 ---
 
