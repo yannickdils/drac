@@ -1,0 +1,28 @@
+{
+  "global": [
+    "provisioningState",
+    "etag",
+    "createdDate",
+    "lastModifiedTime",
+    "creationTime"
+  ],
+  "perType": {
+    "Microsoft.Web/sites": [
+      "outboundIpAddresses",
+      "possibleOutboundIpAddresses",
+      "defaultHostName",
+      "inboundIpAddress"
+    ],
+    "Microsoft.ManagedIdentity/userAssignedIdentities": [
+      "principalId",
+      "clientId",
+      "tenantId"
+    ],
+    "Microsoft.Storage/storageAccounts": [
+      "primaryEndpoints",
+      "secondaryEndpoints",
+      "primaryLocation",
+      "statusOfPrimary"
+    ]
+  }
+}

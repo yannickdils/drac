@@ -1,5 +1,6 @@
 # Pipeline outputs — never committed
 reports/
+_reports/
 *.zip
 
 # Local Azure CLI cache

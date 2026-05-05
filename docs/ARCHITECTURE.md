@@ -1,6 +1,6 @@
 # Architecture: Azure DevOps PR Compliance Pipeline
 
-> **Last Updated:** 2026-03-31  
+> **Last Updated:** 2026-05-04
 > **API Versions:** Resource Graph `2024-04-01` · ARM `2021-04-01` · ADO REST `7.1`
 
 ---
@@ -136,13 +136,31 @@ The `CONFIGURATION-DRIFT.md` file is updated and committed back to the PR branch
 
 ### Stage 5 — DR (`generate-dr-config.ps1` + `validate-dr-config.ps1`)
 
+The actual ARM template transformation lives in the **`scripts/lib/ConvertForDR.psm1`** module (introduced in Round 1 of the implementation brief). `generate-dr-config.ps1` is a thin wrapper that loads exported templates, calls `Convert-ForDR`, and persists the results.
+
 | Transformation | Detail |
 |---|---|
-| Location | All resource `location` fields → `$DR_REGION` |
-| VNet address space | `addressPrefixes` array → `[$DR_VNET_PREFIX]` |
-| Subnet address prefix | `addressPrefix` → `$DR_SUBNET_PREFIX` |
-| Resource names | Prefixed with `$DR_NAMING_PREFIX` (default: `dr-`) |
-| Validation | `az deployment group validate` (non-fatal, reported) |
+| Location | Literal `location` fields → `$DR_REGION` (ARM-expression locations are left alone) |
+| Resource names — top-level | Prefixed with `$DR_NAMING_PREFIX` (default: `dr-`), unless the name is in the reserved-name allowlist (`data/reserved-names.json`). Top-level = `type` matches `Microsoft.X/Y` (single slash). |
+| Resource names — nested types | For multi-slash types (e.g. `Microsoft.Network/virtualNetworks/virtualNetworkPeerings`), the `name` is split by `/` and each segment that matches a known top-level resource is rewritten to its DR name. |
+| Cross-resource references (B2) | Two-pass rewrite: pass 1 builds an `original → dr` name map for top-level resources; pass 2 walks every string in the template and substitutes quote-bounded occurrences. Map keys are iterated longest-first to avoid prefix collisions (`vnet-prod-shared` rewritten before `vnet-prod`). |
+| VNet address space (B3) | Only `Microsoft.Network/virtualNetworks` resources have `properties.addressSpace.addressPrefixes` rewritten — first prefix only; multi-prefix VNets get a `requiresMultiPrefixDR` flag. Address prefixes inside peerings, route tables, and NSG rules are left alone. |
+| First subnet prefix | First non-reserved subnet's `addressPrefix` → `$DR_SUBNET_PREFIX`. Subsequent subnets get a `requiresMultiSubnetDR` flag. |
+| Read-only sanitisation (B4) | Properties listed in `data/readonly-properties.json` (global + per-type) are stripped before transformation so the template is re-deployable. |
+| Deferred-handling flags | Cases the transform consciously deferred surface in `_reports/dr/flags.json` — operator action required. |
+| Validation | `az deployment group validate` (non-fatal, reported). Live validation is the operator's responsibility on first run; structural correctness is asserted in `tests/round-1/`. |
+
+**Files added in Round 1:**
+
+| File | Purpose |
+|---|---|
+| `scripts/lib/ConvertForDR.psm1` | Pure (no Azure / no I/O) ARM transformation module. Exports `Convert-ForDR`, `Get-NameRewriteMap`, `Update-ResourceReferences`, `Remove-ReadOnlyProperties`, `Test-ReservedName`. |
+| `data/reserved-names.json` | Allowlist of subnet names (`GatewaySubnet`, `AzureFirewallSubnet`, …) and fixed resource names that must not be prefixed. |
+| `data/readonly-properties.json` | Global + per-type read-only properties (`provisioningState`, `etag`, storage `primaryEndpoints`, web/site `outboundIpAddresses`, …) stripped prior to redeployment. |
+| `tests/Invoke-Validation.ps1` | Single-entry test runner walking `tests/round-N/`. |
+| `tests/bicep-build-all.ps1` | Bicep compilation gate (no-op until Round 4 introduces modules). |
+| `tests/round-1/Test-ConvertForDR.ps1` | Module-level assertions (B1, B2, B3, B4 + idempotency). |
+| `tests/round-1/Test-GenerateDrConfig-Smoke.ps1` | End-to-end smoke test of the rewired Stage-5 wrapper. |
 
 ### Stage 6 — Report (`post-pr-comment.ps1`)
 
@@ -218,7 +236,13 @@ Edit `scripts/scan/scan-subscriptions.ps1` and add a `run_resource_graph_query` 
 Edit `scripts/drift/detect-drift.ps1` — adjust the `severity` field in `DRIFT_ITEMS`.
 
 ### Add a new naming convention for DR
-Edit `scripts/dr/generate-dr-config.ps1` — extend the `transform` jq function.
+Edit `scripts/lib/ConvertForDR.psm1` — naming logic lives in `Get-NameRewriteMap` and `Invoke-Transformation`. `scripts/dr/generate-dr-config.ps1` is a thin wrapper and rarely needs touching for transformation changes.
+
+### Add a reserved subnet/resource name (so it stays unprefixed)
+Edit `data/reserved-names.json` — add to `subnetNames` or `fixedResourceNames`. No code change needed; the module loads this file on each run.
+
+### Mark a property as read-only (strip it before DR redeploy)
+Edit `data/readonly-properties.json` — add to `global` (every type) or `perType.<provider/type>` (one resource type). No code change needed.
 
 ### Support Terraform state comparison
 Add a new script `scripts/review/match-terraform-state.ps1` that uses `terraform show -json` output and calls the same scan data for lookup.

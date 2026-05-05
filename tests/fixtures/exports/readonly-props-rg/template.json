@@ -1,0 +1,58 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {},
+  "variables": {},
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-01-01",
+      "name": "stgreadonly001",
+      "location": "westeurope",
+      "sku": { "name": "Standard_LRS" },
+      "kind": "StorageV2",
+      "properties": {
+        "accessTier": "Hot",
+        "provisioningState": "Succeeded",
+        "creationTime": "2025-01-15T10:00:00Z",
+        "primaryEndpoints": {
+          "blob": "https://stgreadonly001.blob.core.windows.net/",
+          "queue": "https://stgreadonly001.queue.core.windows.net/"
+        },
+        "secondaryEndpoints": {
+          "blob": "https://stgreadonly001-secondary.blob.core.windows.net/"
+        },
+        "primaryLocation": "westeurope",
+        "statusOfPrimary": "available",
+        "supportsHttpsTrafficOnly": true
+      }
+    },
+    {
+      "type": "Microsoft.Web/sites",
+      "apiVersion": "2023-12-01",
+      "name": "app-readonly-001",
+      "location": "westeurope",
+      "kind": "app",
+      "properties": {
+        "serverFarmId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/readonly-props-rg/providers/Microsoft.Web/serverfarms/asp-readonly",
+        "outboundIpAddresses": "20.1.2.3,20.1.2.4,20.1.2.5",
+        "possibleOutboundIpAddresses": "20.1.2.3,20.1.2.4,20.1.2.5,20.1.2.6",
+        "defaultHostName": "app-readonly-001.azurewebsites.net",
+        "inboundIpAddress": "20.9.8.7",
+        "etag": "\"3f-abcdef\""
+      }
+    },
+    {
+      "type": "Microsoft.ManagedIdentity/userAssignedIdentities",
+      "apiVersion": "2023-01-31",
+      "name": "id-readonly-001",
+      "location": "westeurope",
+      "properties": {
+        "principalId": "11111111-1111-1111-1111-111111111111",
+        "clientId": "22222222-2222-2222-2222-222222222222",
+        "tenantId": "33333333-3333-3333-3333-333333333333"
+      }
+    }
+  ],
+  "outputs": {}
+}

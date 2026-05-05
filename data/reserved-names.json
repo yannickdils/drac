@@ -1,0 +1,12 @@
+{
+  "subnetNames": [
+    "GatewaySubnet",
+    "AzureFirewallSubnet",
+    "AzureFirewallManagementSubnet",
+    "AzureBastionSubnet",
+    "RouteServerSubnet"
+  ],
+  "fixedResourceNames": [
+    "default"
+  ]
+}

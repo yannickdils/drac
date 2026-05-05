@@ -1,7 +1,11 @@
+#Requires -Version 7.2
 # =============================================================================
 # generate-dr-config.ps1
 # Stage 5a: Generate DR-ready Bicep templates for a secondary region.
-# Transforms exported ARM templates: location, VNet CIDR, naming prefix.
+# Transforms exported ARM templates via scripts/lib/ConvertForDR.psm1, which
+# implements the four Round 1 correctness fixes (B1 reserved-name allowlist,
+# B2 cross-resource reference rewriting, B3 context-aware address-space rewriting,
+# B4 read-only property sanitisation).
 # Idempotent: same inputs always produce same outputs.
 # Fault-tolerant: per-RG failures are tracked individually.
 # =============================================================================
@@ -19,12 +23,34 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
 
+# ── Module + data file loading ────────────────────────────────────────────────
+$RepoRoot       = (Resolve-Path (Join-Path $PSScriptRoot ".." "..")).Path
+$ModulePath     = Join-Path $RepoRoot 'scripts/lib/ConvertForDR.psm1'
+$ReservedFile   = Join-Path $RepoRoot 'data/reserved-names.json'
+$ReadOnlyFile   = Join-Path $RepoRoot 'data/readonly-properties.json'
+
+Import-Module $ModulePath -Force
+
+$ReservedNames = @()
+if (Test-Path $ReservedFile) {
+    $r = Get-Content $ReservedFile -Raw | ConvertFrom-Json
+    if ($r.PSObject.Properties['subnetNames'])        { $ReservedNames += @($r.subnetNames) }
+    if ($r.PSObject.Properties['fixedResourceNames']) { $ReservedNames += @($r.fixedResourceNames) }
+}
+
+$ReadOnlySchema = $null
+if (Test-Path $ReadOnlyFile) {
+    $ReadOnlySchema = Get-Content $ReadOnlyFile -Raw | ConvertFrom-Json
+}
+
+# ── Output scaffolding ────────────────────────────────────────────────────────
 $null        = New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "arm")
 $null        = New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "bicep")
 $Timestamp   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 $DateDisplay = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
 $Processed   = 0
 $Failed      = 0
+$AllFlags    = [System.Collections.Generic.List[object]]::new()
 
 Write-Host "============================================================"
 Write-Host "STAGE 5a: Generate DR Configuration"
@@ -33,37 +59,9 @@ Write-Host "  VNet Prefix:   $DrVnetPrefix"
 Write-Host "  Subnet Prefix: $DrSubnetPrefix"
 Write-Host "  Name Prefix:   $DrNamingPrefix"
 Write-Host "  Run ID:        $RunId"
+Write-Host "  Module:        $ModulePath"
+Write-Host "  Reserved:      $($ReservedNames.Count) names loaded"
 Write-Host "============================================================"
-
-# ── Recursive ARM template transformation ─────────────────────────────────────
-function ConvertTo-DrTemplate {
-    param($Node)
-
-    if ($Node -is [System.Management.Automation.PSCustomObject]) {
-        $Props = $Node.PSObject.Properties
-        $New   = [PSCustomObject]@{}
-        foreach ($P in $Props) {
-            $Val = switch ($P.Name) {
-                "location"        { $DrRegion }
-                "addressPrefixes" { @($DrVnetPrefix) }
-                "addressPrefix"   { $DrSubnetPrefix }
-                "name" {
-                    if ($P.Value -is [string] -and -not $P.Value.StartsWith($DrNamingPrefix) -and
-                        $P.Value -notmatch '^\[' -and $P.Value.Length -gt 1) {
-                        "$DrNamingPrefix$($P.Value)"
-                    } else { $P.Value }
-                }
-                default { ConvertTo-DrTemplate $P.Value }
-            }
-            $New | Add-Member -NotePropertyName $P.Name -NotePropertyValue $Val
-        }
-        return $New
-    } elseif ($Node -is [array]) {
-        return @($Node | ForEach-Object { ConvertTo-DrTemplate $_ })
-    } else {
-        return $Node
-    }
-}
 
 # ── Process one resource group ────────────────────────────────────────────────
 function Export-DrResourceGroup {
@@ -76,11 +74,30 @@ function Export-DrResourceGroup {
     Write-Host "  Transforming: $SrcRg -> $DrRg ($DrRegion)"
 
     try {
-        $Template    = Get-Content $TplFile -Raw | ConvertFrom-Json
-        $DrTemplate  = ConvertTo-DrTemplate $Template
+        $Template = Get-Content $TplFile -Raw | ConvertFrom-Json -Depth 50
 
-        # Add DR metadata parameter
-        if (-not $DrTemplate.parameters) { $DrTemplate | Add-Member -NotePropertyName "parameters" -NotePropertyValue ([PSCustomObject]@{}) }
+        $Result = Convert-ForDR -Template $Template `
+            -DrRegion $DrRegion `
+            -DrVnetPrefix $DrVnetPrefix `
+            -DrSubnetPrefix $DrSubnetPrefix `
+            -DrNamingPrefix $DrNamingPrefix `
+            -ReservedNames $ReservedNames `
+            -ReadOnlySchema $ReadOnlySchema
+
+        $DrTemplate = $Result.Template
+
+        # Per-RG flag aggregation — caller persists to _reports/dr/flags.json.
+        $AllFlags.Add([PSCustomObject]@{
+            subscriptionId      = $SubId
+            sourceResourceGroup = $SrcRg
+            drResourceGroup     = $DrRg
+            flags               = $Result.Flags
+        })
+
+        # Add DR metadata parameter (indexer is strict-mode safe even on empty PSCustomObjects).
+        if ($null -eq $DrTemplate.PSObject.Properties['parameters']) {
+            $DrTemplate | Add-Member -NotePropertyName "parameters" -NotePropertyValue ([PSCustomObject]@{})
+        }
         $DrTemplate.parameters | Add-Member -NotePropertyName "drRegion" -NotePropertyValue ([PSCustomObject]@{
             type         = "string"
             defaultValue = $DrRegion
@@ -105,8 +122,10 @@ function Export-DrResourceGroup {
         # Bicep decompile
         $BicepDir = Join-Path $OutputDir "bicep" $SubId $DrRg
         $null = New-Item -ItemType Directory -Force -Path $BicepDir
-        az bicep decompile --file (Join-Path $OutDir "template.json") --outdir $BicepDir 2>$null
-        if ($LASTEXITCODE -ne 0) { Write-Host "  INFO: Bicep decompile skipped for DR $DrRg" }
+        if (Get-Command az -ErrorAction SilentlyContinue) {
+            az bicep decompile --file (Join-Path $OutDir "template.json") --outdir $BicepDir 2>$null
+            if ($LASTEXITCODE -ne 0) { Write-Host "  INFO: Bicep decompile skipped for DR $DrRg" }
+        }
 
         # Deploy script
         $DeployScript = @"
@@ -138,12 +157,18 @@ if (`$Deploy) {
 
         # Metadata
         [ordered]@{
-            subscriptionId    = $SubId
+            subscriptionId      = $SubId
             sourceResourceGroup = $SrcRg
-            drResourceGroup   = $DrRg
-            drRegion          = $DrRegion
-            generatedAt       = $Timestamp
-        } | ConvertTo-Json | Set-Content (Join-Path $OutDir "dr-metadata.json") -Encoding UTF8
+            drResourceGroup     = $DrRg
+            drRegion            = $DrRegion
+            generatedAt         = $Timestamp
+            transform           = "ConvertForDR.psm1"
+            flagsSummary        = [ordered]@{
+                requiresMultiPrefixDR    = @($Result.Flags.requiresMultiPrefixDR).Count
+                requiresMultiSubnetDR    = @($Result.Flags.requiresMultiSubnetDR).Count
+                requiresReservedSubnetDR = @($Result.Flags.requiresReservedSubnetDR).Count
+            }
+        } | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $OutDir "dr-metadata.json") -Encoding UTF8
 
         return $true
     } catch {
@@ -177,13 +202,18 @@ Get-ChildItem (Join-Path $OutputDir "arm") -Recurse -Filter "dr-metadata.json" |
     ConvertTo-Json -Depth 5 |
     Set-Content (Join-Path $OutputDir "dr-index.json") -Encoding UTF8
 
+# Aggregated deferred-handling flags (B3 multi-prefix, multi-subnet, reserved-subnet).
+# Per the brief, this surfaces cases the transform consciously deferred so the operator
+# can review and finish them by hand or in a follow-up round.
+$AllFlags | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $OutputDir "flags.json") -Encoding UTF8
+
 # DR README
 $DrRgCount = (Get-Content (Join-Path $OutputDir "dr-index.json") -Raw | ConvertFrom-Json).Count
 @"
 # Disaster Recovery Configuration
 
-> **Generated:** $DateDisplay  
-> **Pipeline Run:** ``$RunId``  
+> **Generated:** $DateDisplay
+> **Pipeline Run:** ``$RunId``
 > **Target Region:** ``$DrRegion``
 
 ## Overview
@@ -194,7 +224,7 @@ Each subfolder contains:
 - ``template.json`` — ARM template adapted for the DR region
 - ``parameters.json`` — DR-specific parameter values
 - ``deploy-dr.ps1`` — PowerShell deployment script (what-if by default; pass -Deploy to activate)
-- ``dr-metadata.json`` — Transformation metadata
+- ``dr-metadata.json`` — Transformation metadata, including counts of deferred-handling flags
 
 ## Network Configuration
 
@@ -204,6 +234,14 @@ Each subfolder contains:
 | VNet Address Space | ``$DrVnetPrefix`` |
 | Subnet Prefix | ``$DrSubnetPrefix`` |
 | Naming Convention | Resources prefixed with ``$DrNamingPrefix`` |
+
+## Deferred-handling flags
+
+See ``flags.json`` for cases the transform deferred:
+
+- ``requiresMultiPrefixDR`` — VNets with multiple address prefixes; only the first was rewritten.
+- ``requiresMultiSubnetDR`` — VNets with multiple subnets; only the first non-reserved subnet was rewritten.
+- ``requiresReservedSubnetDR`` — VNets where every subnet is a reserved Azure subnet (Gateway / Firewall / Bastion / RouteServer); manual sizing required.
 
 ## ⚠️ Manual Review Required
 
@@ -222,6 +260,7 @@ _Auto-generated. Do not edit manually._
     drRegion  = $DrRegion
     processed = $Processed
     failed    = $Failed
+    transform = "ConvertForDR.psm1"
 } | ConvertTo-Json | Set-Content (Join-Path $OutputDir "dr-summary.json") -Encoding UTF8
 
 Write-Host ""

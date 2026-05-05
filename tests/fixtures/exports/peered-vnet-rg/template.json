@@ -1,0 +1,89 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {},
+  "variables": {},
+  "resources": [
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-09-01",
+      "name": "vnet-hub",
+      "location": "westeurope",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [ "10.10.0.0/16" ]
+        },
+        "subnets": [
+          {
+            "name": "snet-hub-default",
+            "properties": {
+              "addressPrefix": "10.10.0.0/24"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-09-01",
+      "name": "vnet-spoke",
+      "location": "westeurope",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', 'vnet-hub')]"
+      ],
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [ "10.20.0.0/16" ]
+        },
+        "subnets": [
+          {
+            "name": "snet-spoke-default",
+            "properties": {
+              "addressPrefix": "10.20.0.0/24"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "type": "Microsoft.Network/virtualNetworks/virtualNetworkPeerings",
+      "apiVersion": "2023-09-01",
+      "name": "vnet-hub/peer-to-spoke",
+      "dependsOn": [
+        "[resourceId('Microsoft.Network/virtualNetworks', 'vnet-hub')]",
+        "[resourceId('Microsoft.Network/virtualNetworks', 'vnet-spoke')]"
+      ],
+      "properties": {
+        "allowVirtualNetworkAccess": true,
+        "allowForwardedTraffic": false,
+        "allowGatewayTransit": false,
+        "useRemoteGateways": false,
+        "remoteVirtualNetwork": {
+          "id": "[resourceId('Microsoft.Network/virtualNetworks', 'vnet-spoke')]"
+        },
+        "remoteAddressSpace": {
+          "addressPrefixes": [ "10.20.0.0/16" ]
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Network/routeTables",
+      "apiVersion": "2023-09-01",
+      "name": "rt-spoke",
+      "location": "westeurope",
+      "properties": {
+        "routes": [
+          {
+            "name": "to-hub",
+            "properties": {
+              "addressPrefix": "10.10.0.0/16",
+              "nextHopType": "VirtualAppliance",
+              "nextHopIpAddress": "10.10.0.4"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {}
+}

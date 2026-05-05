@@ -1,0 +1,38 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {},
+  "variables": {},
+  "resources": [
+    {
+      "type": "Microsoft.Network/virtualNetworks",
+      "apiVersion": "2023-09-01",
+      "name": "vnet-multi",
+      "location": "westeurope",
+      "properties": {
+        "addressSpace": {
+          "addressPrefixes": [
+            "10.30.0.0/16",
+            "10.31.0.0/16",
+            "172.16.0.0/12"
+          ]
+        },
+        "subnets": [
+          {
+            "name": "snet-multi-default",
+            "properties": {
+              "addressPrefix": "10.30.0.0/24"
+            }
+          },
+          {
+            "name": "snet-multi-second",
+            "properties": {
+              "addressPrefix": "10.31.0.0/24"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {}
+}
