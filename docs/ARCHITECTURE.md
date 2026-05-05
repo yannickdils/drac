@@ -1,6 +1,6 @@
 # Architecture: Azure DevOps PR Compliance Pipeline
 
-> **Last Updated:** 2026-05-04
+> **Last Updated:** 2026-05-05
 > **API Versions:** Resource Graph `2024-04-01` · ARM `2021-04-01` · ADO REST `7.1`
 
 ---
@@ -76,7 +76,30 @@ Pull Request → main
 │  │  • Publishes all artifacts                        │  │
 │  └──────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
+
+Push to main (paths: bicep/regions/dr/**)
+       │
+       ▼
+┌─────────────────────────────────────────────────────────┐
+│  Stage 7: DR DEPLOY  (Round 2 — .github/workflows/dr-   │
+│                                  deploy.yml)             │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │  scripts/dr/deploy-dr-region.ps1                  │  │
+│  │  • Walk bicep/regions/dr/dr-*.bicep               │  │
+│  │  • az group create rg-<workload>-dr (idempotent)  │  │
+│  │  • what-if → _reports/deploy/whatif-*.json        │  │
+│  │  • az deployment group create                     │  │
+│  │       name=draac-<sha7>-rg-<workload>-dr          │  │
+│  │  • Throttling retry (5/15/45/135s exp backoff)    │  │
+│  │  • Per-RG fault tolerance → failures.json         │  │
+│  │  • Final summary → deploy-summary.json            │  │
+│  └──────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
 ```
+
+### Round 2 — DR coverage gate (PR time, in `review` job)
+
+In addition to the six-stage PR pipeline, Round 2 introduces a **DR coverage gate** inside the `review` job that enforces the `bicep/regions/primary/foo.bicep` ↔ `bicep/regions/dr/dr-foo.bicep` convention. For every PR-changed primary file, the gate either confirms the DR companion exists or auto-generates one (`bicep build` → `Convert-ForDR` → `bicep decompile`) and commits it back to the PR branch via the shared `scripts/lib/CommitBack.psm1` helper. See *Stage 3 — Review* below for the full step list.
 
 ---
 
@@ -109,19 +132,31 @@ ELSE → subscriptions: [comma-separated list]
 | Idempotency | Skips already-exported resource groups in the same run |
 | Output | `export-results/arm-templates/`, `export-results/bicep-templates/`, `env-docs/ENVIRONMENT.md` |
 
-### Stage 3 — Review (`identify-pr-changes.ps1` + `match-code-to-deployed.ps1`)
+### Stage 3 — Review (`identify-pr-changes.ps1` + `match-code-to-deployed.ps1` + `check-dr-coverage.ps1`)
 
 | Item | Detail |
 |---|---|
 | Diff source | `git diff origin/main...HEAD` (full history checkout) |
 | IaC types | `.bicep`, `.tf`, ARM `.json`, K8s manifests, Helm |
 | Matching | Case-insensitive resource name lookup in scan JSON |
-| Output | `review-results/deployment-match-report.json` |
+| Output | `review-results/deployment-match-report.json`, `coverage-results/coverage-report.json` |
 
 **File categorisation:**
 - Bicep → `grep` for `name:` properties
 - Terraform → `grep` for `name =` assignments
 - ARM JSON → `jq` `.resources[].name`
+
+**DR coverage gate** (Round 2 §R2.1, runs after the match step):
+
+| Item | Detail |
+|---|---|
+| Script | `scripts/review/check-dr-coverage.ps1` |
+| Convention | `bicep/regions/primary/<workload>.bicep` ↔ `bicep/regions/dr/dr-<workload>.bicep` |
+| If companion exists | record `coverage: ok` |
+| If companion missing | `bicep build` → `Convert-ForDR` (Round 1 module) → `bicep decompile` → write companion → `coverage: auto-generated` |
+| If auto-generation fails | `coverage: failed` and the gate exits non-zero |
+| Commit-back | Auto-generated companions are pushed to the PR branch via `scripts/lib/CommitBack.psm1` (the same helper Stage 4 uses for `CONFIGURATION-DRIFT.md`) |
+| GitHub Actions output | `DR_COVERAGE_OK=true|false` |
 
 ### Stage 4 — Drift (`detect-drift.ps1` + `update-drift-readme.ps1` + `commit-drift-readme.ps1`)
 
@@ -161,6 +196,36 @@ The actual ARM template transformation lives in the **`scripts/lib/ConvertForDR.
 | `tests/bicep-build-all.ps1` | Bicep compilation gate (no-op until Round 4 introduces modules). |
 | `tests/round-1/Test-ConvertForDR.ps1` | Module-level assertions (B1, B2, B3, B4 + idempotency). |
 | `tests/round-1/Test-GenerateDrConfig-Smoke.ps1` | End-to-end smoke test of the rewired Stage-5 wrapper. |
+
+### Stage 7 — DR Deploy (Round 2 §R2.2)
+
+Triggers on push to `main` when `bicep/regions/dr/**` changes; can also be re-run via `workflow_dispatch`. Runs as a separate workflow `.github/workflows/dr-deploy.yml`, not as a job inside `pr-compliance.yml`, because deploy semantics differ: it must run after merge, against the post-merge SHA.
+
+| Item | Detail |
+|---|---|
+| Trigger | `push: branches: [main], paths: ['bicep/regions/dr/**']` + `workflow_dispatch` |
+| Concurrency | `group: draac-dr-deploy, cancel-in-progress: false` (serialised; never cancel an in-flight deploy) |
+| Auth | OIDC via `azure/login@v2`, same secrets as `pr-compliance.yml` |
+| RG strategy | `az group create rg-<workload>-dr --location $DR_TARGET_REGION` (idempotent) per Bicep file |
+| Deployment name | `draac-<sha7>-rg-<workload>-dr` — re-runs at the same commit SHA + same template are no-ops at Azure level |
+| What-if | Runs first per file, persisted to `_reports/deploy/whatif-rg-<workload>-dr.json` |
+| Throttling retry | Detects `429`/`Throttling*`/`TooManyRequests`; exponential backoff `[5, 15, 45, 135]` seconds before failing |
+| Per-RG fault tolerance | Each file's failure is captured in `_reports/deploy/failures.json`; the loop continues to the next file |
+| Final summary | `_reports/deploy/deploy-summary.json` with `processed`, `succeeded`, `failed`, `deploymentNames`, `runId`, `commitSha` |
+| `Test-DRHealth.ps1` invocation | Marked as a comment placeholder; deferred to Round 4 §R4.2 |
+
+**Files added in Round 2:**
+
+| File | Purpose |
+|---|---|
+| `bicep/regions/primary/anchor.bicep` + `bicep/regions/dr/dr-anchor.bicep` | Anchor Storage Account workload that establishes the convention. Compiles clean and serves as the smoke-test target on first install. |
+| `bicep/regions/README.md` | Documents the primary/DR-pair convention and the RG-naming rule (`rg-<workload>` / `rg-<workload>-dr`). |
+| `scripts/lib/CommitBack.psm1` | Shared commit-back helper extracted from `commit-drift-readme.ps1`. Exports `Push-Branch -RepoRoot -Branch -RunId -Files -Message [-MaxRetries]`. Used by both `commit-drift-readme.ps1` (Stage 4) and `check-dr-coverage.ps1` (Stage 3 DR gate). |
+| `scripts/review/check-dr-coverage.ps1` | DR coverage gate. Reads `pr-changes.json`, asserts/auto-generates DR companions for changed primary Bicep files. |
+| `scripts/dr/deploy-dr-region.ps1` | Stage 7 deploy script. `[switch] -DryRun` allows the test harness to exercise the script without touching Azure. |
+| `.github/workflows/dr-deploy.yml` | Stage 7 GitHub Actions workflow. |
+| `tests/round-2/Test-CheckDrCoverage.ps1` | Coverage gate test: happy path, missing companion (auto-gen + failed branches), idempotency, empty change set, non-Bicep change ignored. |
+| `tests/round-2/Test-DeployDrRegion.ps1` | Deploy script test (uses `-DryRun`): two-file walk, deterministic deployment names stable across re-runs, throttling-retry helper unit cases. |
 
 ### Stage 6 — Report (`post-pr-comment.ps1`)
 
