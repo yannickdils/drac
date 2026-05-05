@@ -10,12 +10,13 @@
 
 | Round | Status | Landed | Validation |
 |---|---|---|---|
-| Pre-work — Validation harness | Done (this session) | `tests/` runner + 5 fixtures | `pwsh tests/Invoke-Validation.ps1 -Round 1` |
-| Round 1 — Correctness fixes (B1, B2, B3, B4) | Done (this session) | `scripts/lib/ConvertForDR.psm1`, `data/`, rewired Stage 5 | All assertions pass; PSScriptAnalyzer clean |
+| Pre-work — Validation harness | Done | `tests/` runner + 5 fixtures | `pwsh tests/Invoke-Validation.ps1 -Round 1` |
+| Round 1 — Correctness fixes (B1, B2, B3, B4) | Done | `scripts/lib/ConvertForDR.psm1`, `data/`, rewired Stage 5 | All assertions pass; PSScriptAnalyzer clean |
 | Round 2 — Close Loop A (A1, A2) | Not started | — | — |
 | Round 3 — Open Loop B (A3) | Not started | — | — |
 | Round 4 — Make DR real (A4, A5, E4) | Not started | — | — |
 | Round 5 — Polish (C1, C2, D1–D3, E1–E3, E5) | Not started | — | — |
+| Side track: Demo (`draac-demo/`) | Done | 10 files per `Demo handoff.md` | Bicep compiles, PSScriptAnalyzer clean (parent settings), generator round-trips |
 
 ---
 
@@ -121,6 +122,68 @@ These items are explicitly out of scope for the current session and must be pick
 ## Round 1 commit
 
 The Round 1 work landed as a single commit `feat(draac): Round 1 + validation harness — extract Convert-ForDR module, fix B1–B4`. See `git log --oneline` for the SHA.
+
+---
+
+## Side track — `draac-demo/` subfolder
+
+**Landed 2026-05-04.** Driven by `Demo handoff.md` (a separate spec from `IMPLEMENTATION-BRIEF.md`). Demo is a 10-file, end-to-end DRaaC demonstration meant to be clone-able and runnable on a fresh Azure subscription in <10 minutes. Currently nested inside this repo as `draac-demo/`; can be extracted to its own repo later without code changes (only the `PSScriptAnalyzerSettings.psd1` link to the parent would need to be replicated).
+
+**Files added** (exactly the 10 required by the handoff — no `IMPLEMENTATION-LOG.md` inside the demo per the handoff's strict file inventory rule):
+
+```
+draac-demo/
+├── .github/workflows/pr-validate.yml
+├── .github/workflows/deploy.yml
+├── bicep/main.bicep                # Storage Account in westeurope
+├── bicep/main.dr.bicep             # Storage Account in northeurope (auto-generatable)
+├── scripts/setup.ps1               # One-time AAD app + OIDC + secrets
+├── scripts/generate-dr.ps1         # Three-regex transform from main.bicep -> main.dr.bicep
+├── scripts/post-pr-comment.ps1     # PR-thread comment via gh api
+├── .gitignore
+├── LICENSE                          # Copy of parent MIT
+└── README.md
+```
+
+**Bug fixes applied to the handoff spec** (per the user's instruction "fix any potential bugs you already see and encounter"):
+
+1. `pr-validate.yml` — exit-code capture bug. Original spec:
+   ```powershell
+   $changed = git diff --cached --quiet; $LASTEXITCODE
+   ```
+   This assigns git's stdout (empty under `--quiet`) to `$changed` and then evaluates `$LASTEXITCODE` as a discarded expression — meaning the workflow would never detect a changed DR file and thus never commit it back. Reordered to:
+   ```powershell
+   git diff --cached --quiet
+   $changed = $LASTEXITCODE
+   ```
+
+2. `pr-validate.yml` — validation step replaced. Original spec used `az deployment sub validate --location ... --template-file <RG-scoped Bicep> || true`. Because the demo's Bicep targets the resource-group scope (it defaults to `targetScope = 'resourceGroup'`), submitting it as a *subscription*-scope deployment validation always fails with a scope-mismatch error, which the `|| true` then silently swallowed. Replaced with `az bicep build --file ... --stdout > /dev/null`, which actually validates the Bicep syntax and types and fails the workflow loudly on real errors (per spec section 2.10 "Failure modes are visible, not hidden").
+
+3. `setup.ps1` — removed the unused `$repoOwner` declaration. The original spec assigned `$repoOwner = $RepoFull.Split('/')[0]` and never referenced the variable. PSScriptAnalyzer would have flagged this; removing it is a no-op cleanup.
+
+**Validation results:**
+
+```
+az bicep build --file bicep/main.bicep      → OK
+az bicep build --file bicep/main.dr.bicep   → OK
+generate-dr.ps1 round-trip                  → main.dr.bicep byte-identical to committed file
+Invoke-ScriptAnalyzer -Settings parent      → 0 issues
+```
+
+**Handoff-acceptance — what is and isn't covered:**
+
+| Handoff acceptance | Covered? | Notes |
+|---|---|---|
+| Bicep compiles | ✅ | Both files compile with `az bicep build` locally. |
+| PSScriptAnalyzer clean | ✅ (with parent settings) | The handoff says "zero warnings" but its own use of `Write-Host` for status lines (per section 2.10) trips the default rule set. Reusing the parent `PSScriptAnalyzerSettings.psd1` resolves this; running with default settings produces 22 `PSAvoidUsingWriteHost` warnings — same situation as the parent project. If the demo is later extracted to its own repo, copy `PSScriptAnalyzerSettings.psd1` along with it. |
+| `generate-dr.ps1` produces deterministic output | ✅ | Verified locally: running the generator over the committed `main.bicep` produces a `main.dr.bicep` byte-identical to the committed copy. First-run idempotency holds — the first PR will see the "in sync" status, not the "auto-generated" status. |
+| End-to-end on a sandbox subscription | **Deferred** | Requires a real Azure subscription + GitHub repo to wire OIDC. Operator runs `setup.ps1`, opens a PR, merges. |
+| Re-running `setup.ps1` is a no-op | **Deferred (offline)** | Script logic explicitly checks for existing app, federated credentials, and role assignment before creating; will be a no-op on second run, but unverified without a real run. |
+
+**Notable decisions:**
+
+- **Demo lives inside this repo for now.** The handoff implies a standalone repo (section 9 "fresh user clones the repo"). Per the user's choice, it lives as a subdirectory. Moving it later to its own repo requires copying `LICENSE` (already self-contained), the parent `PSScriptAnalyzerSettings.psd1`, and re-pointing any tooling. The parent's `.gitignore` already covers `.azure/` etc., so the demo's `.gitignore` is partially redundant inside the parent — kept exactly as the handoff specifies for clean extraction later.
+- **Three bug fixes documented above are the only deviations from the handoff text.** No additional features, parameters, or files added.
 
 ---
 

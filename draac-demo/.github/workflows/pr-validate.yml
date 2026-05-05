@@ -1,0 +1,72 @@
+name: "DRaaC Demo: PR Validate"
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'bicep/**'
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.head_ref }}
+
+      - name: Generate DR Bicep
+        shell: pwsh
+        run: pwsh scripts/generate-dr.ps1
+
+      - name: Check if DR file changed
+        id: drcheck
+        shell: pwsh
+        run: |
+          git config user.name  "draac-demo-bot"
+          git config user.email "draac-demo-bot@github-actions.local"
+          git add bicep/main.dr.bicep
+          git diff --cached --quiet
+          $changed = $LASTEXITCODE
+          if ($changed -eq 1) {
+            git commit -m "chore(draac-demo): regenerate main.dr.bicep [skip ci]"
+            git push
+            "status=generated" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            "status=ok" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Validate primary Bicep
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az bicep build --file bicep/main.bicep --stdout > /dev/null
+
+      - name: Validate DR Bicep
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az bicep build --file bicep/main.dr.bicep --stdout > /dev/null
+
+      - name: Post PR comment
+        shell: pwsh
+        run: |
+          pwsh scripts/post-pr-comment.ps1 `
+            -RepoFull "${{ github.repository }}" `
+            -PrNumber "${{ github.event.pull_request.number }}" `
+            -Status "${{ steps.drcheck.outputs.status }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
