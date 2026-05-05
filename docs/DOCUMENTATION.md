@@ -1,8 +1,8 @@
 # Azure DevOps PR Compliance Pipeline — Documentation
 
-> **Version:** 1.0.0  
-> **API Versions:** Resource Graph `2024-04-01` · ARM `2021-04-01` · ADO REST `7.1`  
-> **Last Updated:** 2026-03-31
+> **Version:** 1.0.0
+> **API Versions:** Resource Graph `2024-04-01` · ARM `2021-04-01` · ADO REST `7.1`
+> **Last Updated:** 2026-05-04
 
 ---
 
@@ -205,21 +205,29 @@ In Azure DevOps → Repos → Branches → `main` → Branch policies:
 
 ### Stage 5: Disaster Recovery Configuration
 
-**What it does:** Takes exported ARM templates and generates DR-ready versions targeted at the secondary region.
+**What it does:** Takes exported ARM templates and generates DR-ready versions targeted at the secondary region. As of Round 1 of the implementation brief, the actual transformation lives in **`scripts/lib/ConvertForDR.psm1`** — `generate-dr-config.ps1` is a thin wrapper.
 
 **Scripts:** `scripts/dr/generate-dr-config.ps1`, `scripts/dr/validate-dr-config.ps1`
+**Module:** `scripts/lib/ConvertForDR.psm1`
+**Data files:** `data/reserved-names.json`, `data/readonly-properties.json`
 
-**Transformations applied:**
-1. `location` fields → `$DR_REGION`
-2. `addressPrefixes` → `[$DR_VNET_PREFIX]`
-3. `addressPrefix` → `$DR_SUBNET_PREFIX`
-4. Resource `name` fields → prefixed with `$DR_NAMING_PREFIX`
-5. DR parameters file generated
-6. Deployment shell script generated (what-if safe by default)
+**Transformations applied (Round 1 correctness fixes B1–B4 from `IMPLEMENTATION-BRIEF.md`):**
+
+1. **B1 — Type-aware name prefixing.** Top-level resource names (whose `type` is `Microsoft.X/Y` — single slash) get `$DR_NAMING_PREFIX`. Names listed in `data/reserved-names.json` (`GatewaySubnet`, `AzureFirewallSubnet`, etc.) are preserved exactly. Nested resource names (subnet names inside a VNet, NSG rule names) are NEVER prefixed.
+2. **B2 — Cross-resource reference rewriting.** ARM expressions like `[resourceId('Microsoft.Network/virtualNetworks', 'vnet-prod')]`, `[reference('vnet-prod')]`, and `dependsOn` arrays are rewritten so they point at the DR-prefixed names. Nested-type resource names (e.g. `vnet-hub/peer-to-spoke`) get their parent segments rewritten.
+3. **B3 — Context-aware address-space rewriting.** Only `Microsoft.Network/virtualNetworks` resources have their address space rewritten to `$DR_VNET_PREFIX`. Multi-prefix VNets keep only the first prefix and surface a `requiresMultiPrefixDR` flag in `_reports/dr/flags.json`. Address prefixes inside peerings, route tables, and NSG rules are left alone.
+4. **B4 — Read-only property sanitisation.** Properties listed in `data/readonly-properties.json` (global like `provisioningState`/`etag`, plus per-type like storage `primaryEndpoints` and web/site `outboundIpAddresses`) are stripped before the transform so the template can be redeployed cleanly.
+5. **`location` fields** → `$DR_REGION` (literal values only; ARM expressions are left alone).
+6. DR parameters file generated.
+7. Deployment PowerShell script generated (what-if safe by default).
+8. **`flags.json`** generated, listing every deferred-handling case (multi-prefix VNets, multi-subnet VNets, all-reserved-subnet VNets) for operator review.
 
 **Validation:**
-- Runs `az deployment group validate` on each generated template
-- Failures are recorded but do not block the pipeline (`continueOnError: true`)
+- Runs `az deployment group validate` on each generated template (non-fatal, reported).
+- Structural correctness is also asserted offline by `tests/round-1/Test-ConvertForDR.ps1` and the rewire smoke test `tests/round-1/Test-GenerateDrConfig-Smoke.ps1`. Run them with:
+  ```powershell
+  pwsh tests/Invoke-Validation.ps1 -Round 1
+  ```
 
 ---
 
@@ -360,6 +368,16 @@ chmod +x deploy-dr.ps1
 - This is non-fatal; review `dr-validation-report.json` in the artifact
 - Common causes: missing required parameters, unsupported resource types in target region
 - Manually edit the template or add the missing parameters
+
+### DR template references the original (un-prefixed) resource name
+
+- Round 1's B2 fix should rewrite quote-bounded references in ARM expressions. If you see leftovers, the resource is likely referenced via something other than a quoted string literal (e.g. concatenated parameters).
+- Inspect `tests/round-1/Test-ConvertForDR.ps1`'s peered-VNet assertions to see the exact patterns covered, and add a fixture that captures the new pattern before patching `scripts/lib/ConvertForDR.psm1`.
+
+### "GatewaySubnet" got renamed to "dr-GatewaySubnet"
+
+- This means `data/reserved-names.json` was not loaded. Either the file is missing or `generate-dr-config.ps1` was invoked from a working directory where the relative path could not resolve.
+- The script resolves data files relative to the script's own location (`$PSScriptRoot/../../data/`), so it should not depend on the caller's CWD. Check that the repo layout is intact.
 
 ### "Could not compute diff"
 
