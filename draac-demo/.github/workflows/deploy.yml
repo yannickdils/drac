@@ -1,0 +1,69 @@
+name: "DRaaC Demo: Deploy Both Regions"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'bicep/**'
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Compute deployment names
+        id: names
+        shell: pwsh
+        run: |
+          $sha = "${{ github.sha }}".Substring(0, 7)
+          "primary=draac-demo-$sha-primary" | Out-File $env:GITHUB_OUTPUT -Append
+          "dr=draac-demo-$sha-dr"           | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Create resource groups (idempotent)
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az group create --name rg-draac-demo    --location westeurope --tags draac-demo=true
+            az group create --name rg-draac-demo-dr --location northeurope --tags draac-demo=true
+
+      - name: Deploy primary region
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az deployment group create \
+              --name "${{ steps.names.outputs.primary }}" \
+              --resource-group rg-draac-demo \
+              --template-file bicep/main.bicep \
+              --mode Incremental
+
+      - name: Deploy DR region
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az deployment group create \
+              --name "${{ steps.names.outputs.dr }}" \
+              --resource-group rg-draac-demo-dr \
+              --template-file bicep/main.dr.bicep \
+              --mode Incremental
+
+      - name: Summary
+        shell: pwsh
+        run: |
+          Write-Host "==> Deployment complete"
+          Write-Host "    Primary RG: rg-draac-demo (westeurope)"
+          Write-Host "    DR RG:      rg-draac-demo-dr (northeurope)"
