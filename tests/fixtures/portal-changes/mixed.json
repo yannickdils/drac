@@ -1,0 +1,79 @@
+[
+  {
+    "targetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-foo/providers/Microsoft.Network/virtualNetworks/vnet-x",
+    "targetResourceType": "Microsoft.Network/virtualNetworks",
+    "subscriptionId": "00000000-0000-0000-0000-000000000001",
+    "resourceGroupName": "rg-foo",
+    "resourceName": "vnet-x",
+    "changeType": "Update",
+    "changedBy": "alice@example.com",
+    "timestamp": "2026-05-04T10:00:00Z",
+    "changedProperties": ["properties.tags.foo"]
+  },
+  {
+    "targetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-foo/providers/Microsoft.Network/virtualNetworks/vnet-x",
+    "targetResourceType": "Microsoft.Network/virtualNetworks",
+    "subscriptionId": "00000000-0000-0000-0000-000000000001",
+    "resourceGroupName": "rg-foo",
+    "resourceName": "vnet-x",
+    "changeType": "Update",
+    "changedBy": "alice@example.com",
+    "timestamp": "2026-05-04T11:30:00Z",
+    "changedProperties": ["properties.subnets[0].properties.addressPrefix"]
+  },
+  {
+    "targetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-foo/providers/Microsoft.Network/virtualNetworks/vnet-x",
+    "targetResourceType": "Microsoft.Network/virtualNetworks",
+    "subscriptionId": "00000000-0000-0000-0000-000000000001",
+    "resourceGroupName": "rg-foo",
+    "resourceName": "vnet-x",
+    "changeType": "Update",
+    "changedBy": "bob@example.com",
+    "timestamp": "2026-05-04T12:34:56Z",
+    "changedProperties": ["properties.tags.foo", "properties.subnets[0].properties.addressPrefix"]
+  },
+  {
+    "targetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-bar/providers/Microsoft.Storage/storageAccounts/staccounted",
+    "targetResourceType": "Microsoft.Storage/storageAccounts",
+    "subscriptionId": "00000000-0000-0000-0000-000000000001",
+    "resourceGroupName": "rg-bar",
+    "resourceName": "staccounted",
+    "changeType": "Update",
+    "changedBy": "carol@example.com",
+    "timestamp": "2026-05-04T09:00:00Z",
+    "changedProperties": ["provisioningState"]
+  },
+  {
+    "targetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/NetworkWatcherRG/providers/Microsoft.Network/networkWatchers/NetworkWatcher_westeurope",
+    "targetResourceType": "Microsoft.Network/networkWatchers",
+    "subscriptionId": "00000000-0000-0000-0000-000000000001",
+    "resourceGroupName": "NetworkWatcherRG",
+    "resourceName": "NetworkWatcher_westeurope",
+    "changeType": "Update",
+    "changedBy": "system",
+    "timestamp": "2026-05-04T08:00:00Z",
+    "changedProperties": ["properties.tags.purpose"]
+  },
+  {
+    "targetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/AzureBackupRG_westeurope_1/providers/Microsoft.Compute/snapshots/snap-1",
+    "targetResourceType": "Microsoft.Compute/snapshots",
+    "subscriptionId": "00000000-0000-0000-0000-000000000001",
+    "resourceGroupName": "AzureBackupRG_westeurope_1",
+    "resourceName": "snap-1",
+    "changeType": "Create",
+    "changedBy": "system",
+    "timestamp": "2026-05-04T07:00:00Z",
+    "changedProperties": ["properties.creationData"]
+  },
+  {
+    "targetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-baz/providers/Microsoft.Web/sites/app-public",
+    "targetResourceType": "Microsoft.Web/sites",
+    "subscriptionId": "00000000-0000-0000-0000-000000000001",
+    "resourceGroupName": "rg-baz",
+    "resourceName": "app-public",
+    "changeType": "Update",
+    "changedBy": "dave@example.com",
+    "timestamp": "2026-05-04T06:00:00Z",
+    "changedProperties": ["properties.siteConfig.appSettings"]
+  }
+]

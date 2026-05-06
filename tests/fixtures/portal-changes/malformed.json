@@ -1,0 +1,17 @@
+[
+  {
+    "targetResourceId": "/subscriptions/00000000-0000-0000-0000-000000000001/resourceGroups/rg-good/providers/Microsoft.Network/virtualNetworks/vnet-good",
+    "resourceGroupName": "rg-good",
+    "resourceName": "vnet-good",
+    "changeType": "Update",
+    "timestamp": "2026-05-04T10:00:00Z",
+    "changedProperties": ["properties.tags.foo"]
+  },
+  {
+    "resourceGroupName": "rg-bad",
+    "resourceName": "vnet-bad",
+    "changeType": "Update",
+    "timestamp": "2026-05-04T10:00:00Z",
+    "changedProperties": ["properties.tags.foo"]
+  }
+]
