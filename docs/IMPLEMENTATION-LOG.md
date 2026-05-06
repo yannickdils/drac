@@ -328,4 +328,106 @@ Invoke-ScriptAnalyzer -Settings parent      → 0 issues
 
 ---
 
+## Round 4 — Make DR real (R4.1, R4.2, R4.3, R4.4)
+
+**Landed 2026-05-06.** Goal: replace the empty DR resource shells from R1–R3 with real replication, traffic routing, and secrets sync. Largest round so far.
+
+**Approach.** Main thread first landed a small bootstrap (registry-driven dispatch shell on `Convert-ForDR`, public-facing-workload detection on `check-dr-coverage`, plus two new R4 tests). Then four general-purpose agents in parallel against fully-disjoint scopes:
+
+- **Agent A** — `bicep/modules/dr-{sql,cosmos,storage,keyvault,postgres,mysql,redis}.bicep` + `tests/round-4/Test-DrModules-Compile.ps1` + populated `data/dr-module-registry.json`.
+- **Agent B** — `scripts/dr/Test-DRHealth.ps1` (per-family probes + dispatcher) + `tests/round-4/Test-DRHealth.ps1` + `tests/fixtures/dr-health/all-healthy.json`.
+- **Agent C** — `bicep/modules/dr-traffic.bicep` (Azure Front Door Premium) + `tests/round-4/Test-DrTrafficModule.ps1`.
+- **Agent D** — `bicep/modules/dr-keyvault-sync.bicep` + `bicep/modules/dr-keyvault-sync-drrole.bicep` (added during integration to fix BCP139, see below) + `scripts/secrets/Sync-KeyVaultSecrets.ps1` + `tests/round-4/Test-SyncKeyVaultSecrets.ps1` + the architectural decision text for `docs/ARCHITECTURE.md`.
+
+The integrator collated docs (ARCHITECTURE / DOCUMENTATION / IMPLEMENTATION-LOG / NEXT-SESSION-BRIEF) into this single commit.
+
+**Files added / modified:**
+
+| File | Notes |
+|---|---|
+| `scripts/lib/ConvertForDR.psm1` | **Bootstrap.** Added `$script:DrModuleRegistry`, exported `Register-DrModule` / `Unregister-DrModule` / `Clear-DrModuleRegistry` / `Get-DrModuleRegistry` / `Initialize-DefaultDrModuleRegistry` / `Get-DispatchedResource`. `Convert-ForDR` now runs dispatch *before* the name-rewrite transform so the dispatch record's `originalName` is the genuine input-template name and `drName` is computed via the rewrite map (including parent-segment rewriting for nested types). Result shape gains a `Dispatched` field. Idempotent and backwards-compatible: empty registry → `Dispatched: @()` → R1–R3 behaviour unchanged. |
+| `scripts/review/check-dr-coverage.ps1` | **Bootstrap.** Added `Test-IsPublicFacingPrimary` (text inspection of the Bicep source for any of `Microsoft.Web/sites`, `Microsoft.ContainerService/managedClusters`, `Microsoft.Network/applicationGateways`) and `Test-DrCompanionReferencesTraffic` (greps the DR Bicep for `dr-traffic.bicep`). Coverage gate now fails any public-facing primary whose DR companion does NOT reference `dr-traffic.bicep`, both on the existing-companion path and the just-auto-generated path (with a remediation hint in the failure reason). |
+| `data/dr-module-registry.json` | **Bootstrap shell + populated by Agent A.** Maps the 7 Round-4 resource families to their module file names. |
+| `bicep/modules/dr-sql.bicep` | SQL DB DR via failover group + automatic policy. API `2023-08-01`. Uses `existing` ref to the primary server — must deploy to **primary** RG. |
+| `bicep/modules/dr-cosmos.bicep` | Multi-region Cosmos with automatic failover. API `2024-11-15`. |
+| `bicep/modules/dr-storage.bicep` | Storage with RA-GZRS (Standard) / cross-region restore intent (Premium). API `2024-01-01`. **Premium DR is currently a no-op deploy** — cross-region restore lives at the Backup-Vault layer, not the storage account. Module records intent in `metadata.dr.crossRegionRestoreEnabled` and tags it; provisioning the Backup Vault is an R5 deferral. |
+| `bicep/modules/dr-keyvault.bicep` | Key Vault with soft-delete + purge protection. API `2024-11-01`. |
+| `bicep/modules/dr-postgres.bicep` | Postgres read replica, `createMode: Replica`. API `2024-08-01`. |
+| `bicep/modules/dr-mysql.bicep` | MySQL read replica, `createMode: Replica`. API `2024-12-30`. |
+| `bicep/modules/dr-redis.bicep` | Redis geo-replication via `linkedServers`. API `2024-11-01`. **Premium-only enforced via `@allowed`** — `Basic`/`Standard` callers fail at template-validation time. Uses `existing` ref to the primary cache — must deploy to **primary** RG. |
+| `bicep/modules/dr-traffic.bicep` | Azure Front Door Premium + WAF + optional custom domain. API `2025-06-01` / `2025-11-01`. `metadata.dr` is a **file-level** Bicep statement (resource-level `metadata` is not allowed by Bicep) — same convention used in Agent A's modules. |
+| `bicep/modules/dr-keyvault-sync.bicep` | Function App (Y1 consumption, Linux, PowerShell 7.4) + Event Grid system topic on the primary KV + role assignments + storage + App Insights + UAMI. APIs `2025-03-01` (Web), `2025-08-01` (Storage), `2025-02-15` (EventGrid), `2024-11-30` (ManagedIdentity), `2022-04-01` (Authorization), `2020-02-02` (Insights). |
+| `bicep/modules/dr-keyvault-sync-drrole.bicep` | Cross-RG role-assignment sub-module — added during integration to fix BCP139. Invoked from `dr-keyvault-sync.bicep` via `module ... scope: resourceGroup(<sub>, <rg>)` parsed from the DR vault id. |
+| `scripts/dr/Test-DRHealth.ps1` | Per-family DR health probes (SQL / Cosmos / Storage / KV / Postgres / MySQL / Redis). `-DryRun -FixtureFile` test seam runs the entire dispatch pipeline against a hand-rolled fixture. Outputs `_reports/dr-health/dr-health.json` + `DR_HEALTH_OK` / `DR_HEALTH_SUMMARY` GitHub Actions outputs. `-FailOnUnhealthy` flips a true unhealthy into a non-zero exit (default exit 0; the gate is in the GitHub Actions output, not the exit code, matching the rest of the project). |
+| `scripts/secrets/Sync-KeyVaultSecrets.ps1` | The Function App's `run.ps1`, also runnable standalone. Two parameter sets (`EventGrid` / `Manual`) so both the Functions host and the test harness can drive it. `-DryRun` skips all `Az.KeyVault` calls. `DRAAC_SECRETS_FORCE_INSYNC=1` env var forces the in-sync short-circuit branch. |
+| `tests/round-4/Test-ConvertForDR-Dispatch.ps1` | Bootstrap test for the dispatch shell. Empty registry → 0 dispatched, populated registry → 2 dispatched (Storage Account + SQL DB), idempotency on already-prefixed input, `Initialize-DefaultDrModuleRegistry` loads the on-disk mapping (assertions verify Storage / SQL / KV entries are present). |
+| `tests/round-4/Test-CheckDrCoverage-FrontDoor.ps1` | Bootstrap test for the public-facing gate. Public-facing primary + companion references `dr-traffic.bicep` → ok; same primary + companion missing the reference → coverage failed; non-public-facing primary → gate is a no-op. |
+| `tests/round-4/Test-DrModules-Compile.ps1` | Per-module `bicep build` + structural assertion (expected resource type appears, `metadata.dr` block carries non-empty `mode` for SQL and Storage). Skip-if-no-CLI guard. |
+| `tests/round-4/Test-DRHealth.ps1` | 6 scenarios: all-healthy / idempotent / SQL degraded / Postgres unhealthy / missing fixture (exit 2) / unknown via missing probeResult. Spawns `pwsh -File` so the script's `exit N` doesn't terminate the test runner. |
+| `tests/round-4/Test-DrTrafficModule.ps1` | Compile + structural (Premium SKU, two origins, WAF/security policy linkage). Custom-domain conditional: scenario A asserts the resource has a `condition` field (proves `if (hasCustomDomain)` was compiled) and the wrapper ARM does NOT contain the literal hostname; scenario B asserts the customDomain resource is present and references the parameter. |
+| `tests/round-4/Test-SyncKeyVaultSecrets.ps1` | Happy path / wrong event type / forced in-sync / Bicep compile. |
+| `tests/fixtures/dr-health/all-healthy.json` | Shared base fixture; tests mutate per-scenario into `$Workdir/<scenario>.json`. |
+| `docs/ARCHITECTURE.md` | New "Round 4 — Make DR real (R4.1–R4.4)" section between Stage 8 and Stage 6, with R4.1 dispatch contract + the R4.4 KV-strategy architectural decision. |
+| `docs/DOCUMENTATION.md` | New "Stage 7-DR" operator-facing section covering the four sub-rounds plus operator notes (cross-RG deploys, R4.5 sandbox-acceptance deferrals). |
+
+**Three integration bugs caught and fixed during validation** (agents had no shell access; main thread surfaced these on first harness run):
+
+1. **`Test-ConvertForDR-Dispatch.ps1` — initial-registry assertion stale.** I wrote the bootstrap test before Agent A populated the registry, so the assertion expected 0 entries; Agent A landed 7. Fixed the assertion to require ≥7 and verify the Storage / SQL / KV mappings explicitly so a future truncation of `data/dr-module-registry.json` would still trip the test.
+
+2. **`Test-DrTrafficModule.ps1` — custom-domain conditional misread Bicep semantics.** Agent C's test asserted that `customDomainName=''` produces zero `Microsoft.Cdn/profiles/customDomains` resources in the compiled ARM. Bicep's `if (...)` actually compiles to an ARM `condition` field — the resource declaration is *always* in the template; the template engine skips it at deploy time when the condition evaluates to false. Replaced the assertion with two checks: (a) every customDomains resource has a `condition` field (proves the `if (hasCustomDomain)` was wired), and (b) the rendered wrapper ARM does NOT contain the literal `'app.example.com'` in scenario A (proves the param value was correctly empty).
+
+3. **`dr-keyvault-sync.bicep` — BCP139 cross-RG role assignment.** Agent D declared the DR-side role assignment inline with `scope: drVaultExisting` where `drVaultExisting` was a cross-RG `existing` reference (`scope: resourceGroup(...)`). Bicep raises BCP139 because role-assignment resources can only be deployed to the RG that contains the target resource. Fix: split the DR role assignment into a new sub-module `dr-keyvault-sync-drrole.bicep` and invoke it via `module ... scope: resourceGroup(<sub>, <rg>)` parsed from the DR vault id. Also fixed BCP334 (false-positive storage-name min-length) by adding `@minLength(1)` on `workloadName` and a `#disable-next-line BCP334` directive — the storage name is provably ≥14 chars but Bicep's analyzer can't see through `take/replace/string-interpolation`. Fixed an unrelated single-quote escape error in the sub-module's `@description` (Bicep uses `\'` not `''`).
+
+**Validation results:**
+
+```
+pwsh tests/Invoke-Validation.ps1 -Round '1','2','3','4'
+Round Test                               ExitCode Status Duration
+----- ----                               -------- ------ --------
+1     Test-ConvertForDR.ps1                     0 PASS
+1     Test-GenerateDrConfig-Smoke.ps1           0 PASS
+2     Test-CheckDrCoverage.ps1                  0 PASS
+2     Test-DeployDrRegion.ps1                   0 PASS
+3     Test-FindPortalChanges.ps1                0 PASS
+3     Test-SendToManualQueue.ps1                0 PASS
+3     Test-SyncPortalChange.ps1                 0 PASS
+4     Test-CheckDrCoverage-FrontDoor.ps1        0 PASS
+4     Test-ConvertForDR-Dispatch.ps1            0 PASS
+4     Test-DRHealth.ps1                         0 PASS
+4     Test-DrModules-Compile.ps1                0 PASS
+4     Test-DrTrafficModule.ps1                  0 PASS
+4     Test-SyncKeyVaultSecrets.ps1              0 PASS
+Total: 13  Pass: 13  Fail: 0
+```
+
+```
+Invoke-ScriptAnalyzer -Settings PSScriptAnalyzerSettings.psd1
+  Round 4 files: 0 issues (after 4 per-function suppressions added with justifications)
+  Pre-existing legacy scripts: 15 warnings (deferred to Round 5 §D1/D2/D3)
+```
+
+```
+az bicep build on each of the 9 new Bicep modules: all clean.
+```
+
+**Acceptance per brief — what is and isn't covered:**
+
+| Brief acceptance (R4.5) | Covered? | Notes |
+|---|---|---|
+| Deploy a workload with SQL DB + Storage + KV through the full pipeline | **Deferred** | Cannot execute without an Azure subscription. Module library is structurally proven via `bicep build` on each file. |
+| Confirm DR side has SQL failover group active, Storage RA-GZRS, KV with synced secrets | **Deferred** | Same — needs sandbox sub. The `-DryRun` paths in `Test-DRHealth.ps1` and `Sync-KeyVaultSecrets.ps1` exercise the full code path against fixtures. |
+| Manually trigger Front Door health probe failure on primary; confirm DR endpoint takes traffic | **Deferred** | Live failover test — operator action. |
+| Run `Test-DRHealth.ps1`; confirm all green | **Deferred / structurally proven** | The `-DryRun -FixtureFile` test seam exercises the dispatcher + every per-family probe against a synthesized "all-healthy" fixture. The probe-result shape per family is documented in the test fixture for operator reference. |
+| `Invoke-PSRule -Module PSRule.Rules.Azure -InputPath bicep/modules/` clean | **Deferred** | PSRule.Rules.Azure not installed in this session. Pre-work step from the brief; meaningful now that R4 modules exist. Operator action for Round 5 acceptance. |
+
+**Notable design decisions (worth knowing for Round 5+):**
+
+- **Dispatch runs before the name-rewrite transform.** Earlier (mid-integration) attempt placed dispatch after `Invoke-Transformation`, which meant `originalName` reflected post-rewrite state — wrong by contract. Moving it after `Get-NameRewriteMap` but before `Invoke-Transformation` means `originalName` is the genuine input name and `drName` is computed via the rewrite map. The same logic is reused for nested types: parent-segment rewrite gives `dr-sqlsrv01/db01` for input `sqlsrv01/db01` when `sqlsrv01` is in the map.
+- **Cross-RG role assignment via sub-module.** `dr-keyvault-sync-drrole.bicep` is the reusable pattern for any cross-RG role-assignment work. R5 / future rounds can copy this shape rather than re-discover BCP139.
+- **`metadata.dr` is at the file level, not the resource level.** Bicep does NOT allow a `metadata` property on resource declarations — only `metadata` at the file scope (compiles to `template.metadata`) or `metadata` decorators on `param` declarations. All R4 modules follow this convention; the test reads `template.metadata.dr.mode` to assert the contract.
+- **Two jobs, not three, for portal-drift sync (carried from R3) — and similarly, the brief's "three jobs for KV sync" implication folds into one Function App.** The split-runtime architecture (Event Grid → Function → Az.KeyVault) is unicausal and benefits from no inter-job artifact passing.
+- **`-FailOnUnhealthy` is opt-in, not default.** `Test-DRHealth.ps1` exits 0 by default even when unhealthy — the gate is in the GitHub Actions output (`DR_HEALTH_OK=false`) so the PR comment can reflect the state without failing the workflow. Matches the rest of the project's "GA outputs drive policy, not exit codes" pattern. Operators wiring this into a hard gate use `-FailOnUnhealthy`.
+
+---
+
 _Log started 2026-05-04. Append, never rewrite history. Every commit that lands a brief item should add an entry here in the same commit._
