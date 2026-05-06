@@ -1,6 +1,6 @@
 # Architecture: Azure DevOps PR Compliance Pipeline
 
-> **Last Updated:** 2026-05-05
+> **Last Updated:** 2026-05-06
 > **API Versions:** Resource Graph `2024-04-01` · ARM `2021-04-01` · ADO REST `7.1`
 
 ---
@@ -226,6 +226,36 @@ Triggers on push to `main` when `bicep/regions/dr/**` changes; can also be re-ru
 | `.github/workflows/dr-deploy.yml` | Stage 7 GitHub Actions workflow. |
 | `tests/round-2/Test-CheckDrCoverage.ps1` | Coverage gate test: happy path, missing companion (auto-gen + failed branches), idempotency, empty change set, non-Bicep change ignored. |
 | `tests/round-2/Test-DeployDrRegion.ps1` | Deploy script test (uses `-DryRun`): two-file walk, deterministic deployment names stable across re-runs, throttling-retry helper unit cases. |
+
+### Stage 8 — Portal Drift Sync (Round 3 §R3.1–§R3.4)
+
+Triggered on a daily schedule (`02:00 UTC`, well within Resource Graph's 14-day change-table retention) plus `workflow_dispatch`. Reverse-engineers changes made in the Azure Portal back into the repo as PRs (or `portal-sync-manual` issues when Bicep decompile is too dirty for automation).
+
+| Item | Detail |
+|---|---|
+| Trigger | `schedule: cron "0 2 * * *"` + `workflow_dispatch (lookback-hours optional input)` |
+| Concurrency | `group: draac-portal-drift-sync, cancel-in-progress: false` (sync runs serialised) |
+| Auth | OIDC `azure/login@v2`; `GITHUB_TOKEN` for `gh pr create` / `gh issue create` |
+| Detection | `Find-PortalChanges.ps1` runs the §R3.2 KQL against `resourcechanges` over the last `LookbackHours` (default 24) |
+| Filter rules | (1) Skip if every changed property is in `data/readonly-properties.json`'s `global` list (no real change). (2) Skip system-managed resources by name OR RG: `NetworkWatcher*`, `DefaultResourceGroup*`, `cloud-shell*`, `AzureBackupRG*`. |
+| Coalescing | Coalesce-then-skip — multiple changes against the same `targetResourceId` collapse into one entry holding the latest snapshot, then skip rules apply to that snapshot |
+| Per-change pipeline | `Sync-PortalChange.ps1`: `az resource show` → wrap as ARM → `bicep decompile`. Clean output → `Convert-ForDR` (Round 1 module) → write primary + DR Bicep → branch `portal-sync/<yyyyMMddUTC>-<sha256-12>` → `Push-Branch` (CommitBack helper) → `gh pr create` |
+| Dirty decompile fallback | `Send-ToManualQueue.ps1`: writes the original ARM JSON to `_reports/sync/manual-queue/<sha256-12>.json`, then `gh issue create --label portal-sync-manual` with reviewer checklist + `changedBy` mention/assignment. Idempotent: existing open issue with the same hash → no-op. |
+| Deduplication | Both branches and issues are keyed by 12 hex chars of `SHA-256(lower(resourceId))`. Branches are scoped per UTC day (`yyyyMMdd-<hash>`) so a same-day re-run is a no-op; issues are open-issue-deduplicated by hash search. |
+| Outputs | `_reports/sync/portal-changes.json`, `portal-changes-skipped.json`, `portal-changes-summary.json`, `sync-summary.json`, `manual-queue-summary.json` |
+
+**Files added in Round 3:**
+
+| File | Purpose |
+|---|---|
+| `.github/workflows/portal-drift-sync.yml` | Stage 8 workflow. Two jobs (detect → sync); `Send-ToManualQueue` runs inline inside the sync job per change rather than as a third top-level job. |
+| `scripts/sync/Find-PortalChanges.ps1` | Detection. KQL via `az graph query`; `-DryRun -FixtureFile <path>` test seam exercises the same filter/coalesce pipeline against hand-rolled JSON. |
+| `scripts/sync/Sync-PortalChange.ps1` | Per-change reverse-engineering. Type-slug naming (`microsoft-network-virtualnetworks` etc.), 12-char SHA-256 hash for branch + manual-queue alignment, `gh pr list --search` dedup. `-DryRun` skips all `az` / `gh` / `git` calls. Two env-var hooks for tests: `DRAAC_SYNC_FORCE_DIRTY_RESOURCE_IDS` and `DRAAC_SYNC_FORCE_EXISTING_PRS`. |
+| `scripts/sync/Send-ToManualQueue.ps1` | Manual-queue fallback. Hash-keyed dedup against existing open `portal-sync-manual` issues. ARM JSON snapshot to `_reports/sync/manual-queue/<hash>.json`. Best-effort `--assignee` on `changedBy` when it looks like a GitHub login; mention-only otherwise. |
+| `tests/round-3/Test-FindPortalChanges.ps1` | Detection test: 7-row mixed fixture (vnet-x coalescing, NetworkWatcher / AzureBackupRG / readonly-only skips), idempotency, malformed-row tolerance, `-DryRun` requires `-FixtureFile`. |
+| `tests/round-3/Test-SyncPortalChange.ps1` | Per-change pipeline test: clean + dirty decompile cases via env-var force, two-change run, idempotency on branch-name re-derivation, helper unit tests. |
+| `tests/round-3/Test-SendToManualQueue.ps1` | Manual-queue test: ARM snapshot path + hash determinism, `-DryRun` outcomes, dedup short-circuit on simulated existing issue. |
+| `tests/fixtures/portal-changes/mixed.json` + `malformed.json` | Detection fixtures. |
 
 ### Stage 6 — Report (`post-pr-comment.ps1`)
 

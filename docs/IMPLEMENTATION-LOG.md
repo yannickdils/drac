@@ -13,7 +13,7 @@
 | Pre-work — Validation harness | Done | `tests/` runner + 5 fixtures | `pwsh tests/Invoke-Validation.ps1 -Round 1` |
 | Round 1 — Correctness fixes (B1, B2, B3, B4) | Done | `scripts/lib/ConvertForDR.psm1`, `data/`, rewired Stage 5 | All assertions pass; PSScriptAnalyzer clean |
 | Round 2 — Close Loop A (A1, A2) | Done | DR coverage gate, `bicep/regions/{primary,dr}/`, Stage 7 deploy workflow, shared `CommitBack.psm1` | 4/4 tests pass; PSScriptAnalyzer clean (12 files); both anchor Bicep files compile |
-| Round 3 — Open Loop B (A3) | Not started | — | — |
+| Round 3 — Open Loop B (A3) | Done | `Find-PortalChanges`, `Sync-PortalChange`, `Send-ToManualQueue`, Stage 8 workflow | 7/7 tests pass; PSScriptAnalyzer clean for new files (legacy warnings deferred to R5) |
 | Round 4 — Make DR real (A4, A5, E4) | Not started | — | — |
 | Round 5 — Polish (C1, C2, D1–D3, E1–E3, E5) | Not started | — | — |
 | Side track: Demo (`draac-demo/`) | Done | 10 files per `Demo handoff.md` | Bicep compiles, PSScriptAnalyzer clean (parent settings), generator round-trips |
@@ -188,6 +188,81 @@ pwsh tests/bicep-build-all.ps1 -Path bicep/regions               →  2 succeede
 - **`-DryRun` test seam on `deploy-dr-region.ps1`.** The script has a `[switch] -DryRun` flag that skips `az group create / what-if / deploy` and writes synthetic outputs. Tests never touch Azure; the production workflow never sets the flag. Cleanest way to isolate Azure-calling code from a unit-test boundary without mocking infrastructure.
 - **`CommitBack.psm1` extraction was scope creep, but worth it.** The R2.1 agent observed it would have to copy 60-odd lines of git-auth + retry logic from `commit-drift-readme.ps1`. Extracting one shared module saves the duplication and means future commit-back patterns (Round 3's portal-sync PR creation, for example) inherit the same auth + retry semantics. CLI contract of `commit-drift-readme.ps1` is unchanged so this is invisible to the existing `pr-compliance.yml`.
 - **Stage 7 lives in its own workflow, not as a job in `pr-compliance.yml`.** Brief implies a single pipeline; the implementation diverges because deploy must run *after* merge against the post-merge SHA. Branch protection / merge-queue enforcement should still gate `pr-compliance.yml` (which is what blocks merge); `dr-deploy.yml` runs unconditionally on merge to `main`.
+
+---
+
+## Round 3 — Open Loop B (A3 portal-drift sync)
+
+**Landed 2026-05-06.** Goal: detect Azure Portal changes and reverse-engineer them into the repo automatically.
+
+**Approach:** three parallel agents, scaled up from Round 2's two. Disjoint file scopes (R3.2 owned `Find-PortalChanges.ps1`, R3.3 owned `Sync-PortalChange.ps1`, R3.4 owned `Send-ToManualQueue.ps1`). Both R3.3 and R3.4 received the same `Get-ResourceIdHash` formula and `Send-ToManualQueue` parameter contract so their branch/file/issue dedup keys stay aligned. Main thread bootstrapped nothing this round (R2's `bicep/regions/` already in place), wrote the workflow YAML, validated, fixed three integration bugs that the agents could not catch (their sandbox blocked PowerShell execution, same as Round 2).
+
+**Files added:**
+
+| File | Notes |
+|---|---|
+| `.github/workflows/portal-drift-sync.yml` | Stage 8 workflow. Schedule `02:00 UTC daily` + `workflow_dispatch`. Two jobs: detect + sync. Concurrency `group: draac-portal-drift-sync, cancel-in-progress: false`. The brief says "three jobs"; the third (manual-queue-fallback) is folded into the sync job because `Sync-PortalChange.ps1` invokes `Send-ToManualQueue.ps1` inline per dirty decompile — splitting that across jobs would require artifact passing for "leftover" changes and adds zero value over the inline form. |
+| `scripts/sync/Find-PortalChanges.ps1` | KQL detection. `-DryRun -FixtureFile <path>` test seam runs the same filter/coalesce pipeline against hand-rolled JSON. Coalesce-then-skip ordering: latest snapshot drives the keep decision. |
+| `scripts/sync/Sync-PortalChange.ps1` | Per-change reverse-engineering. Type-slug naming (`Microsoft.Network/virtualNetworks` → `microsoft-network-virtualnetworks`), 12-char SHA-256 over `lower(resourceId)`, `gh pr list --search` dedup. `-DryRun` short-circuits all `az`/`gh`/`git` calls. Two env-var test hooks: `DRAAC_SYNC_FORCE_DIRTY_RESOURCE_IDS`, `DRAAC_SYNC_FORCE_EXISTING_PRS`. |
+| `scripts/sync/Send-ToManualQueue.ps1` | Manual-queue fallback. Hash-keyed dedup against existing open `portal-sync-manual` issues. `--assignee` only when `changedBy` looks like a GitHub login (1–39 chars, no `@`); mention-only otherwise. Snapshot path: `_reports/sync/manual-queue/<hash>.json`. |
+| `tests/round-3/Test-FindPortalChanges.ps1` | 7-row mixed fixture proves coalescing + skip-by-name-or-rg + skip-by-readonly + idempotency + malformed-row tolerance + dry-run-rejects-without-fixture. |
+| `tests/round-3/Test-SyncPortalChange.ps1` | Two-change run (clean + simulated-dirty), idempotency, helper unit tests. Uses env-var hooks to inject the dirty case without needing a real bad ARM. |
+| `tests/round-3/Test-SendToManualQueue.ps1` | Hash determinism, ARM snapshot path, dry-run outcomes, dedup short-circuit on simulated existing issue. |
+| `tests/fixtures/portal-changes/mixed.json` + `malformed.json` | Detection fixtures. |
+| `docs/ARCHITECTURE.md` | Added Stage 8 ASCII block + Round 3 file inventory. |
+| `docs/DOCUMENTATION.md` | Added "Stage 8: Portal Drift Sync" operator section. |
+
+**Three integration bugs caught and fixed during validation** (agents had no shell access; main thread surfaced these on first harness run):
+
+1. **`Get-PropertyValue` single-element array unwrap (Find-PortalChanges).** When a fixture row's `changedProperties` was `["provisioningState"]`, `return $Object.$Name` triggered PowerShell's pipeline auto-unwrap and the helper returned the bare string `"provisioningState"`. Downstream `ConvertTo-PropertyPathList` saw a string, fell through its `IEnumerable && !string` check, and emitted `@()`. Result: every single-element changedProperties got reset to empty, so the readonly-only skip rule never matched. Fixed by adding a `, $val` (comma) wrap inside `Get-PropertyValue` for array-typed values to defeat the unwrap. The string branch in `ConvertTo-PropertyPathList` was also hardened to handle a bare-string fallback.
+
+2. **`ConvertTo-Json -InputObject @($array) -AsArray` double-wrap.** The script wrote `[[...]]` instead of `[...]` because `-InputObject` plus `-AsArray` adds two layers of array wrapping. Switched to the pipeline form (`$arr | ConvertTo-Json -AsArray`) which produces a single top-level array even for 0 items.
+
+3. **Test-FindPortalChanges timestamp comparison.** PowerShell 7.5+ `ConvertFrom-Json` auto-converts ISO 8601 strings to `[DateTime]`. The test compared a `[string]` literal against the parsed `[DateTime]`, and `-eq` stringified the DateTime in the current culture (`05/04/2026 12:34:56`). Hardened the test to normalise both sides to ISO before comparing.
+
+**Validation results:**
+
+```
+pwsh tests/Invoke-Validation.ps1 -Round '1','2','3'
+Round Test                            ExitCode Status
+1     Test-ConvertForDR.ps1                  0 PASS
+1     Test-GenerateDrConfig-Smoke.ps1        0 PASS
+2     Test-CheckDrCoverage.ps1               0 PASS
+2     Test-DeployDrRegion.ps1                0 PASS
+3     Test-FindPortalChanges.ps1             0 PASS
+3     Test-SendToManualQueue.ps1             0 PASS
+3     Test-SyncPortalChange.ps1              0 PASS
+Total: 7  Pass: 7  Fail: 0
+```
+
+```
+Invoke-ScriptAnalyzer -Settings PSScriptAnalyzerSettings.psd1
+  Round 3 files: 0 issues
+  Pre-existing legacy scripts: 15 warnings (in detect-drift.ps1, match-code-to-deployed.ps1,
+    update-drift-readme.ps1, post-pr-comment*.ps1, scan-subscriptions.ps1, write-job-summary.ps1).
+    Brief's "new code adds zero warnings" rule is met. Round 5 §D1 (compile-then-match) and
+    §D2 (tuple matching) explicitly rewrite match-code-to-deployed.ps1; the others will be
+    cleaned up alongside as part of R5 polish.
+```
+
+**Acceptance per brief — what is and isn't covered:**
+
+| Brief acceptance (R3.5) | Covered? | Notes |
+|---|---|---|
+| Make a small portal change, trigger workflow manually, confirm a PR is opened | **Deferred** | Cannot execute without an Azure subscription and a configured GitHub repo (OIDC federation, secrets). Code path is exercised end-to-end via `-DryRun` with both clean and forced-dirty changes. |
+| For C3: pick a resource type known to decompile dirty (e.g. KV with access policies); confirm an issue is filed instead of a broken PR | **Deferred / structurally proven** | The dirty branch is exercised in `Test-SyncPortalChange.ps1` via `DRAAC_SYNC_FORCE_DIRTY_RESOURCE_IDS`. The actual real-world dirty case (KV access policies) needs a live subscription. |
+
+**Notable design decisions (worth knowing for Round 4+):**
+
+- **Two jobs, not three.** The brief says "three jobs: detect → decompile-and-pr → manual-queue-fallback". In practice, `Sync-PortalChange.ps1` handles both the clean (PR) and dirty (manual-queue) dispositions inline per change, so the third job has nothing to do that the second job didn't already finish. Splitting them would require artifact passing of "leftover" changes and adds no value. Documented in the workflow YAML comment.
+
+- **Hash alignment between R3.3 and R3.4.** Both scripts compute the same `SHA-256(lower(resourceId))[0..5]` 12-char hash. R3.3 uses it for branch names (`portal-sync/<yyyyMMddUTC>-<hash>`); R3.4 uses it for the manual-queue snapshot filename and the `gh issue list --search <hash>` dedup. A reviewer can correlate a PR branch and a manual-queue file by the same hash. Both agents implemented `Get-ResourceIdHash` independently and the integrator confirmed the algorithm matches — verified by the agents themselves cross-reading each other's files during their runs.
+
+- **Coalesce-then-skip, not skip-then-coalesce.** R3.2 coalesces multiple changes against the same resource BEFORE applying skip rules, so the keep/skip decision is driven by the resource's *latest* snapshot. The brief is silent on the order; this matches the operator's mental model ("did the resource still need a sync, considering its most recent change?").
+
+- **`workflow_dispatch` input for `lookback-hours`.** Useful when investigating an incident from yesterday or backfilling after the workflow was paused. Default is the brief's 24 h.
+
+- **Pre-existing legacy script warnings are in scope for Round 5, not Round 3.** Brief §R5.3 (D3) deletes the `.sh` files and §D1/§D2 rewrites `match-code-to-deployed.ps1`. The 15 warnings will be cleaned up there, not now.
 
 ---
 

@@ -2,7 +2,7 @@
 
 > **Version:** 1.0.0
 > **API Versions:** Resource Graph `2024-04-01` · ARM `2021-04-01` · ADO REST `7.1`
-> **Last Updated:** 2026-05-05
+> **Last Updated:** 2026-05-06
 
 ---
 
@@ -291,6 +291,44 @@ bicep/regions/
 **Manual re-run:** Trigger via the Actions tab → "DRaaC DR Deploy" → "Run workflow". Useful for re-deploying without a code change (e.g. after manually deleting an RG).
 
 **Test-DRHealth invocation point:** A comment placeholder in `deploy-dr-region.ps1` marks where the post-deploy health check will hook in once Round 4 §R4.2 is implemented.
+
+---
+
+### Stage 8: Portal Drift Sync (Round 3 §R3.1–§R3.4)
+
+**What it does:** Once a day at 02:00 UTC (and on demand via `workflow_dispatch`), DRaaC scans Azure for resource changes that were made through the Portal (or otherwise outside this repo) and reverse-engineers them into PRs — or files a `portal-sync-manual` issue when Bicep decompile is too dirty for automation.
+
+**Workflow:** `.github/workflows/portal-drift-sync.yml`
+**Scripts:** `scripts/sync/Find-PortalChanges.ps1`, `scripts/sync/Sync-PortalChange.ps1`, `scripts/sync/Send-ToManualQueue.ps1`
+
+**Two jobs:**
+
+1. **detect** — runs `Find-PortalChanges.ps1` against the Resource Graph `resourcechanges` table over the last 24 h (configurable via `workflow_dispatch` input). Filters out global read-only-property changes (using `data/readonly-properties.json`'s `global` list — i.e. real *content* changes, not framework-internal noise) and Azure system-managed resources (`NetworkWatcher*`, `DefaultResourceGroup*`, `cloud-shell*`, `AzureBackupRG*`). Coalesces multiple changes against the same resource into one entry holding the latest snapshot. Outputs `portal-changes.json`. Sets `has-changes` job output.
+
+2. **sync** (only runs if `has-changes == 'true'`) — runs `Sync-PortalChange.ps1`. Per change:
+   - `az resource show` for the live ARM JSON → wrap as a single-resource ARM template.
+   - `bicep decompile`. Clean (no warnings, exit 0): produce primary + DR Bicep via `Convert-ForDR`, branch `portal-sync/<yyyyMMddUTC>-<sha256-12>`, push, open a PR titled `[portal-sync] Reconcile portal change to <resource-name>`.
+   - Dirty (warnings or non-zero exit): `Send-ToManualQueue.ps1` snapshots the ARM JSON to `_reports/sync/manual-queue/<sha256-12>.json` and opens a `portal-sync-manual` issue with reviewer checklist + decompile output + ARM template. Existing open issue with the same hash → no-op.
+
+**PR / issue dedup:** Both branches and issues are keyed by 12 hex chars of `SHA-256(lower(resourceId))`. Branches are scoped per UTC day (`yyyyMMdd-<hash>`) so a same-day re-run is a no-op. `gh pr list --search` checks for existing open PRs before creating; same for issues.
+
+**Required secrets** (no new secrets; re-uses what `pr-compliance.yml` already needs):
+
+| Secret | Purpose |
+|---|---|
+| `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` / `AZURE_SUBSCRIPTION_ID` | OIDC auth |
+| `DR_TARGET_REGION`, `DR_VNET_ADDRESS_PREFIX`, `DR_SUBNET_ADDRESS_PREFIX` | passed through to `Convert-ForDR` |
+
+**OIDC subject:** the workflow runs on a schedule (i.e. against `refs/heads/main`), so the App Registration's federated credential needs the `repo:<owner>/<repo>:ref:refs/heads/main` subject — same one Round 2's `dr-deploy.yml` requires. If you set up DRaaC with only the PR-scope subject, run `setup-github.ps1` again to add the main subject.
+
+**Manual triggering:** Actions tab → "DRaaC Portal Drift Sync" → "Run workflow". Optionally pass a custom `lookback-hours`.
+
+**What appears in the repo:**
+
+- A PR titled `[portal-sync] Reconcile portal change to <resource-name>` with primary + DR Bicep, list of changed properties, reviewer checklist, and a portal link to the resource.
+- Or an issue labelled `portal-sync-manual` with the ARM JSON, decompile warnings, and reviewer instructions.
+
+**Re-running on the same day:** Idempotent — branches are stable per (day, resource-id), so the second run is a no-op against any open PRs from the first.
 
 ---
 
