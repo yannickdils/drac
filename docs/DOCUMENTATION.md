@@ -332,6 +332,66 @@ bicep/regions/
 
 ---
 
+### Stage 7-DR: DR Module Library + Health + Traffic + Secrets Sync (Round 4)
+
+**What it does:** Closes the gap between "DR companion files exist" and "DR is actually a working failover destination." Round 4 ships a per-resource-family DR Bicep module library, post-deploy health probes, an Azure Front Door traffic-routing module, and an event-driven Key Vault secrets-sync runbook.
+
+#### R4.1 — DR module library (`bicep/modules/dr-*.bicep`)
+
+| Module | Family | Replication |
+|---|---|---|
+| `dr-sql.bicep` | `Microsoft.Sql/servers/databases` | Failover groups + automatic policy |
+| `dr-cosmos.bicep` | `Microsoft.DocumentDB/databaseAccounts` | Multi-region writes + automatic failover |
+| `dr-storage.bicep` | `Microsoft.Storage/storageAccounts` | RA-GZRS (Standard) / cross-region restore intent (Premium) |
+| `dr-keyvault.bicep` | `Microsoft.KeyVault/vaults` | Soft-delete + purge protection (secrets sync handled by R4.4) |
+| `dr-postgres.bicep` | `Microsoft.DBforPostgreSQL/flexibleServers` | Read replica (`createMode: Replica`) |
+| `dr-mysql.bicep` | `Microsoft.DBforMySQL/flexibleServers` | Read replica (`createMode: Replica`) |
+| `dr-redis.bicep` | `Microsoft.Cache/Redis` | Geo-replication via `linkedServers` (Premium-only) |
+
+`Convert-ForDR` reads `data/dr-module-registry.json` to know which types should be replaced with module references in the auto-generated DR companion. Caller-side wiring (post-decompile rewrite) is deferred to Round 5; for now the dispatch step records the intent and surfaces it on `Convert-ForDR`'s `Dispatched` field.
+
+**Cross-RG deploys.** `dr-sql.bicep` and `dr-redis.bicep` use `existing` references to the primary server / cache, so the deployment must target the **primary** RG (the failover group / linked server lives there). Stage 7's `deploy-dr-region.ps1` is unchanged in this round; an operator wiring these modules will need to drive the deployment with `--resource-group rg-<workload>` (primary) for these two families instead of the `-dr` default.
+
+#### R4.2 — DR health probes (`scripts/dr/Test-DRHealth.ps1`)
+
+Runs after Stage 7 succeeds. Reads the Stage 7 `_reports/deploy/deploy-summary.json`, walks each DR resource group, and dispatches per-family probes (SQL `replicationState == "CATCH_UP"` and lag, Cosmos `provisioningState` and DR region in `readLocations`, Storage secondary endpoints + `lastSyncTime` recency, KV `enablePurgeProtection`/`enableSoftDelete`, Postgres/MySQL replica `state`, Redis `linkedServers` state).
+
+```powershell
+pwsh scripts/dr/Test-DRHealth.ps1 \
+    -DeploySummaryFile _reports/deploy/deploy-summary.json \
+    -OutputDir _reports/dr-health \
+    -DrRegion northeurope \
+    -SqlLagThresholdSeconds 60 \
+    -StorageSyncToleranceMinutes 15
+```
+
+Outputs `_reports/dr-health/dr-health.json` and writes `DR_HEALTH_OK=true|false` + `DR_HEALTH_SUMMARY=<healthy>/<total>` to `$GITHUB_OUTPUT` so the PR comment can summarise health. Per-resource probe failures are logged + skipped (status `unknown`); only `degraded` or `unhealthy` flip `DR_HEALTH_OK` to false.
+
+`-DryRun -FixtureFile <json>` runs the entire pipeline against a hand-rolled fixture so the test harness exercises the full flow without an Azure subscription.
+
+#### R4.3 — Azure Front Door traffic routing (`bicep/modules/dr-traffic.bicep`)
+
+A mandatory traffic-routing module for any workload that exposes any of `Microsoft.Web/sites`, `Microsoft.ContainerService/managedClusters`, or `Microsoft.Network/applicationGateways`. The DR coverage gate (`scripts/review/check-dr-coverage.ps1`) **fails any PR** where a public-facing primary's DR companion does NOT contain a `dr-traffic.bicep` reference. Auto-generated companions cannot synthesise this wiring; the gate's failure message includes a remediation hint with a copy-paste-ready `module traffic '../../modules/dr-traffic.bicep' = { ... }` snippet.
+
+Module shape (Front Door Premium):
+- Origin group with primary (priority 1, weight 1000) + DR (priority 2, weight 1000) origins
+- Health probes (HTTPS HEAD on `healthProbePath`, default `/`, 30s interval, 3-of-4 success threshold ≈ 90s failover window)
+- WAF policy (Microsoft Default Rule Set v2.1 + Bot Manager v1.1, mode `Detection` or `Prevention`)
+- Optional custom domain — emits `Microsoft.Cdn/profiles/customDomains` only when `customDomainName` parameter is non-empty
+
+#### R4.4 — Key Vault secrets-sync runbook (`bicep/modules/dr-keyvault-sync.bicep` + `scripts/secrets/Sync-KeyVaultSecrets.ps1`)
+
+DRaaC's chosen KV strategy is **replicated vaults with an event-driven sync runbook** (option (b) in the brief). One-time deploy of `dr-keyvault-sync.bicep` per workload provisions:
+
+- A PowerShell-runtime Function App (Y1 consumption, Linux, PowerShell 7.4) in the primary region
+- An Event Grid system topic on the primary KV (`topicType: 'Microsoft.KeyVault.vaults'`) with an event subscription filtering to `Microsoft.KeyVault.SecretNewVersionCreated`
+- Two role assignments — `Key Vault Secrets User` on the primary vault (inline) + `Key Vault Secrets Officer` on the DR vault (via the `dr-keyvault-sync-drrole.bicep` cross-RG sub-module — cross-RG role assignments cannot be inline in Bicep)
+- App Insights for the Function
+
+`scripts/secrets/Sync-KeyVaultSecrets.ps1` is the Function's `run.ps1`. It reads the new secret version from the primary vault via the system MI (`Az.KeyVault`), checks if the DR vault already holds the same value (idempotency short-circuit), and writes if not. `-DryRun` and the `DRAAC_SECRETS_FORCE_INSYNC` env var make the script test-driveable.
+
+**Operator action on first install:** the brief's R4.5 acceptance — deploy a workload with SQL DB + Storage + KV through the full pipeline, manually trigger Front Door health-probe failure on primary, run `Test-DRHealth.ps1` — is left to the operator with a sandbox subscription. Round 4 ships the building blocks; the integration test against a live subscription is in the deferrals list (`docs/NEXT-SESSION-BRIEF.md`).
+
 ### Stage 6: Final Report & PR Annotation
 
 **What it does:** Aggregates all reports and posts (or updates) a structured comment on the PR.

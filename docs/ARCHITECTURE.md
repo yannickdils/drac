@@ -257,6 +257,73 @@ Triggered on a daily schedule (`02:00 UTC`, well within Resource Graph's 14-day 
 | `tests/round-3/Test-SendToManualQueue.ps1` | Manual-queue test: ARM snapshot path + hash determinism, `-DryRun` outcomes, dedup short-circuit on simulated existing issue. |
 | `tests/fixtures/portal-changes/mixed.json` + `malformed.json` | Detection fixtures. |
 
+### Round 4 — Make DR real (R4.1–R4.4)
+
+Round 4 closes the gap between "DR companion files exist" and "DR is actually a working failover destination". Empty resource shells aren't DR — data has to replicate, traffic has to route, secrets have to sync. The round adds:
+
+- **R4.1** — Per-resource-family DR Bicep modules under `bicep/modules/dr-*.bicep`. `Convert-ForDR` gains a registry-driven dispatch step that records which top-level resources should be replaced with module references (vs. naive copies) in the auto-generated DR companion. The registry lives at `data/dr-module-registry.json` and is loaded via `Initialize-DefaultDrModuleRegistry`.
+- **R4.2** — `scripts/dr/Test-DRHealth.ps1` runs per-family probes against deployed DR resources after Stage 7 finishes. Output `_reports/dr-health/dr-health.json`; `DR_HEALTH_OK=true|false` exposed via `$GITHUB_OUTPUT` for the PR comment.
+- **R4.3** — `bicep/modules/dr-traffic.bicep` — Azure Front Door Premium with primary (priority 1) + DR (priority 2) origins, WAF, optional custom domain. The Stage 3 DR coverage gate (`check-dr-coverage.ps1`) enforces that any PR touching a public-facing workload type (`Microsoft.Web/sites`, `Microsoft.ContainerService/managedClusters`, `Microsoft.Network/applicationGateways`) ships a DR companion that references this module.
+- **R4.4** — `bicep/modules/dr-keyvault-sync.bicep` (+ a sub-module for the cross-RG role assignment) deploys a PowerShell-runtime Function App in the primary region. `scripts/secrets/Sync-KeyVaultSecrets.ps1` is the Function's `run.ps1` — Event Grid fires it on `Microsoft.KeyVault.SecretNewVersionCreated`, it reads the new secret version from the primary vault and writes it to the DR vault. Idempotent (skips if the DR vault already has the same value), `-DryRun` test seam.
+
+#### R4.1 module-dispatch contract
+
+`Convert-ForDR` returns a `Dispatched` array of records: `{ type, originalName, drName, module, resource }`. Dispatch runs *before* the name-rewrite transform so `originalName` is the input-template name and `drName` reflects the rewrite map (including the parent-segment rewrite for nested types like `Microsoft.Sql/servers/databases`). `Convert-ForDR` does NOT mutate the template based on dispatch — the caller (today: `check-dr-coverage.ps1`'s auto-gen path; future: a post-decompile rewriter) decides whether to swap naive resource declarations for `module` references. Default registry (loaded from `data/dr-module-registry.json`):
+
+| Type | Module | Replication |
+|---|---|---|
+| `Microsoft.Sql/servers/databases` | `dr-sql.bicep` | Failover groups + automatic policy |
+| `Microsoft.DocumentDB/databaseAccounts` | `dr-cosmos.bicep` | Multi-region writes + automatic failover |
+| `Microsoft.Storage/storageAccounts` | `dr-storage.bicep` | RA-GZRS (Standard) / cross-region restore intent (Premium) |
+| `Microsoft.KeyVault/vaults` | `dr-keyvault.bicep` | Soft-delete + purge protection (secrets sync via R4.4) |
+| `Microsoft.DBforPostgreSQL/flexibleServers` | `dr-postgres.bicep` | Read replica (`createMode: Replica`) |
+| `Microsoft.DBforMySQL/flexibleServers` | `dr-mysql.bicep` | Read replica (`createMode: Replica`) |
+| `Microsoft.Cache/Redis` | `dr-redis.bicep` | Geo-replication via `linkedServers` (Premium-only — `@allowed` enforces) |
+
+Cross-RG caveats baked in at module level: `dr-sql.bicep` and `dr-redis.bicep` use `existing` references to the primary server/cache. They must be deployed against the **primary** RG (the failover group / linked server lives there). `dr-keyvault-sync.bicep` invokes a sub-module `dr-keyvault-sync-drrole.bicep` with `scope: resourceGroup(<sub>, <rg>)` derived from the DR vault's id, because role assignments to a resource in another RG must be deployed in that RG (Bicep BCP139).
+
+#### R4.4 secrets-sync architectural decision
+
+DRaaC adopts **option (b): replicated Key Vaults with an event-driven sync runbook.** Each protected workload owns two vaults — `kv-<workload>` in the primary region and `kv-<workload>-dr` in the DR region — and an Event Grid system topic on `Microsoft.KeyVault.SecretNewVersionCreated` fires a PowerShell-runtime Azure Function (`Sync-KeyVaultSecrets`, see `scripts/secrets/Sync-KeyVaultSecrets.ps1`) that reads the new secret version from the primary vault and writes it to the DR vault. The Function App lives in the primary region (low-latency to the Event Grid system topic and the primary KV). Auth uses a system-assigned managed identity with `Key Vault Secrets User` on the primary vault and `Key Vault Secrets Officer` on the DR vault.
+
+| Why (b)? | Detail |
+|---|---|
+| Blast radius matches the rest of DRaaC | Every other family in §R4.1 replicates per-workload (failover groups, multi-region Cosmos, GRS/RA-GRS storage). Per-workload KV pairs keep the DR boundary workload-scoped — a vault compromise or accidental purge in one workload never spills into another. |
+| Idempotency + replayability are cheap | Event Grid retries up to 30 times over 24 h; the script's pre-write idempotency check (`Test-AlreadySynced`) makes any retry a no-op. No external state (queue, durable function) needed. |
+| Operator mental model is simple | If the primary region is gone, point the workload at `kv-<workload>-dr`. The DR vault has `enablePurgeProtection: true` and `softDeleteRetentionInDays: 90` so a botched failover is recoverable inside the brief's RPO. |
+
+**Alternatives considered** (kept reversible):
+
+- **Shared global Key Vault with Private Endpoints.** Cheaper (one vault, one set of secrets, no sync code) but Azure Key Vault is *not* multi-region — the PE only routes traffic; if the vault's home region is down, every workload is down. Single-blast-radius failure mode unacceptable for the workloads in scope. Also, RBAC/access-policy changes propagate instantly across all workloads, increasing change risk.
+- **Managed HSM with multi-region replication.** Azure Managed HSM is the only HSM-backed Microsoft offering that *can* replicate cryptographic material across regions in the same security domain. Cost is an order of magnitude higher (~$3/h per HSM minimum), the API surface differs from `Microsoft.KeyVault/vaults` (parallel code path through the rest of DRaaC), and the brief's workload set does not require FIPS 140-2 Level 3 hardware roots of trust. RTO/RPO is better but the cost/complexity delta does not pay off for the documented threat model.
+
+**Reversibility:** to migrate off (b) later, deprovision per-workload DR vaults, point workloads at the new target, and decommission the sync Function + Event Grid system topic. The existing `Sync-KeyVaultSecrets.ps1` script can be re-purposed as a one-shot importer with a single `-EventFile` per secret. Existing replicated vaults stay in soft-delete for the retention window (90 days) as a rollback path before being purged.
+
+**Files added in Round 4:**
+
+| File | Purpose |
+|---|---|
+| `bicep/modules/dr-sql.bicep` | SQL DB DR via failover group + automatic policy. API `2023-08-01`. |
+| `bicep/modules/dr-cosmos.bicep` | Multi-region Cosmos with automatic failover. API `2024-11-15`. |
+| `bicep/modules/dr-storage.bicep` | Storage with RA-GZRS (Standard) / cross-region restore intent (Premium). API `2024-01-01`. |
+| `bicep/modules/dr-keyvault.bicep` | Key Vault with soft-delete + purge protection. API `2024-11-01`. |
+| `bicep/modules/dr-postgres.bicep` | Postgres read replica. API `2024-08-01`. |
+| `bicep/modules/dr-mysql.bicep` | MySQL read replica. API `2024-12-30`. |
+| `bicep/modules/dr-redis.bicep` | Redis geo-replication (Premium-only). API `2024-11-01`. |
+| `bicep/modules/dr-traffic.bicep` | Azure Front Door Premium + WAF + optional custom domain. API `2025-06-01` / `2025-11-01`. |
+| `bicep/modules/dr-keyvault-sync.bicep` | Function App + Event Grid system topic + role assignments + storage + App Insights + UAMI. APIs `2025-03-01` (Web), `2025-08-01` (Storage), `2025-02-15` (EventGrid), `2024-11-30` (ManagedIdentity), `2022-04-01` (Authorization), `2020-02-02` (Insights). |
+| `bicep/modules/dr-keyvault-sync-drrole.bicep` | Cross-RG role-assignment sub-module (DR side). |
+| `data/dr-module-registry.json` | Type → module mapping consumed by `Convert-ForDR`'s dispatch step. |
+| `scripts/dr/Test-DRHealth.ps1` | Per-family DR health probes; `-DryRun -FixtureFile` test seam. Outputs `_reports/dr-health/dr-health.json` + `DR_HEALTH_OK` / `DR_HEALTH_SUMMARY` GitHub Actions outputs. |
+| `scripts/secrets/Sync-KeyVaultSecrets.ps1` | The Function App's `run.ps1`. Two parameter sets (`EventGrid` / `Manual`) so both the Functions host and the test harness can drive it. `-DryRun` skips all `Az.KeyVault` calls. |
+| `tests/round-4/Test-ConvertForDR-Dispatch.ps1` | Convert-ForDR dispatch contract (empty registry no-op, populated registry records 2 dispatches, idempotency, registry init from disk). |
+| `tests/round-4/Test-CheckDrCoverage-FrontDoor.ps1` | R4.3 gate: public-facing primary + companion missing dr-traffic.bicep → coverage failed. |
+| `tests/round-4/Test-DrModules-Compile.ps1` | Per-module `bicep build` + structural assertion (`metadata.dr` block present). Skip-if-no-CLI guard. |
+| `tests/round-4/Test-DRHealth.ps1` | 6 scenarios: all-healthy / idempotent / SQL degraded / Postgres unhealthy / missing fixture / unknown via missing probeResult. |
+| `tests/round-4/Test-DrTrafficModule.ps1` | Compile + structural (Premium SKU, two origins, WAF/security policy linkage, custom-domain conditional). |
+| `tests/round-4/Test-SyncKeyVaultSecrets.ps1` | Happy path / wrong event type / forced in-sync / Bicep compile. |
+| `tests/fixtures/dr-health/all-healthy.json` | Shared base fixture; tests mutate per-scenario. |
+
 ### Stage 6 — Report (`post-pr-comment.ps1`)
 
 | Item | Detail |

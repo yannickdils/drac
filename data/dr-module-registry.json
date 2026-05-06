@@ -1,0 +1,12 @@
+{
+  "_comment": "Round 4 (R4.1) — maps top-level Azure resource types to Bicep module file names under bicep/modules/. Convert-ForDR's dispatch step uses this to record which resources should be replaced by module references in the auto-generated DR companion. Populated as Agent A's modules ship; empty entries simply fall through to the R1-R3 naive-copy behaviour.",
+  "modules": {
+    "Microsoft.Sql/servers/databases": "dr-sql.bicep",
+    "Microsoft.DocumentDB/databaseAccounts": "dr-cosmos.bicep",
+    "Microsoft.Storage/storageAccounts": "dr-storage.bicep",
+    "Microsoft.KeyVault/vaults": "dr-keyvault.bicep",
+    "Microsoft.DBforPostgreSQL/flexibleServers": "dr-postgres.bicep",
+    "Microsoft.DBforMySQL/flexibleServers": "dr-mysql.bicep",
+    "Microsoft.Cache/Redis": "dr-redis.bicep"
+  }
+}

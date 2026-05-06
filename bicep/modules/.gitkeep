@@ -1,0 +1,16 @@
+# Round 4 — DR Bicep module library
+#
+# Per-resource-family DR companion modules. Convert-ForDR's dispatch step
+# (data/dr-module-registry.json) replaces naive resource copies in the
+# auto-generated DR Bicep with module references pointing at this directory.
+#
+# Files added in Round 4:
+#   dr-sql.bicep        — Microsoft.Sql/servers/databases (failover groups)
+#   dr-cosmos.bicep     — Microsoft.DocumentDB/databaseAccounts
+#   dr-storage.bicep    — Microsoft.Storage/storageAccounts (RA-GZRS)
+#   dr-keyvault.bicep   — Microsoft.KeyVault/vaults
+#   dr-postgres.bicep   — Microsoft.DBforPostgreSQL/flexibleServers
+#   dr-mysql.bicep      — Microsoft.DBforMySQL/flexibleServers
+#   dr-redis.bicep      — Microsoft.Cache/Redis (Premium)
+#   dr-traffic.bicep    — Azure Front Door Premium (R4.3)
+#   dr-keyvault-sync.bicep — Function App for KV secret sync (R4.4)

@@ -1,0 +1,109 @@
+{
+  "_comment": "Round 4 §R4.2 fixture for Test-DRHealth.ps1 — every probe returns a green payload. The dispatcher walks `resources`, looks up each entry's `probeResult`, and short-circuits the per-family probe to use this data instead of calling az.",
+  "resourceGroups": [
+    "rg-anchor-dr",
+    "rg-cosmos-dr",
+    "rg-storage-dr",
+    "rg-keyvault-dr",
+    "rg-postgres-dr",
+    "rg-mysql-dr",
+    "rg-redis-dr"
+  ],
+  "resources": [
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-anchor-dr/providers/Microsoft.Sql/servers/sqlsrv-anchor/databases/db-anchor",
+      "type": "Microsoft.Sql/servers/databases",
+      "name": "sqlsrv-anchor/db-anchor",
+      "resourceGroup": "rg-anchor-dr",
+      "probeResult": {
+        "replicationState": "CATCH_UP",
+        "replicationLag": 4,
+        "partnerServer": "sqlsrv-anchor-primary"
+      }
+    },
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-cosmos-dr/providers/Microsoft.DocumentDB/databaseAccounts/cosmos-anchor",
+      "type": "Microsoft.DocumentDB/databaseAccounts",
+      "name": "cosmos-anchor",
+      "resourceGroup": "rg-cosmos-dr",
+      "probeResult": {
+        "provisioningState": "Succeeded",
+        "readLocations": [
+          { "locationName": "West Europe" },
+          { "locationName": "North Europe" }
+        ],
+        "writeLocations": [
+          { "locationName": "West Europe" }
+        ]
+      }
+    },
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-storage-dr/providers/Microsoft.Storage/storageAccounts/stanchordr",
+      "type": "Microsoft.Storage/storageAccounts",
+      "name": "stanchordr",
+      "resourceGroup": "rg-storage-dr",
+      "probeResult": {
+        "secondaryEndpoints": {
+          "blob": "https://stanchordr-secondary.blob.core.windows.net/",
+          "queue": "https://stanchordr-secondary.queue.core.windows.net/",
+          "table": "https://stanchordr-secondary.table.core.windows.net/",
+          "file": "https://stanchordr-secondary.file.core.windows.net/"
+        },
+        "geoReplicationStats": {
+          "lastSyncTime": "__RECENT_ISO__",
+          "status": "Live"
+        },
+        "statusOfSecondary": "available"
+      }
+    },
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-keyvault-dr/providers/Microsoft.KeyVault/vaults/kv-anchor-dr",
+      "type": "Microsoft.KeyVault/vaults",
+      "name": "kv-anchor-dr",
+      "resourceGroup": "rg-keyvault-dr",
+      "probeResult": {
+        "properties": {
+          "enableSoftDelete": true,
+          "enablePurgeProtection": true,
+          "provisioningState": "Succeeded"
+        }
+      }
+    },
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-postgres-dr/providers/Microsoft.DBforPostgreSQL/flexibleServers/pg-anchor-dr",
+      "type": "Microsoft.DBforPostgreSQL/flexibleServers",
+      "name": "pg-anchor-dr",
+      "resourceGroup": "rg-postgres-dr",
+      "probeResult": {
+        "state": "Replicating",
+        "replica": {
+          "role": "AsyncReplica",
+          "replicationState": "Replicating"
+        }
+      }
+    },
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-mysql-dr/providers/Microsoft.DBforMySQL/flexibleServers/mysql-anchor-dr",
+      "type": "Microsoft.DBforMySQL/flexibleServers",
+      "name": "mysql-anchor-dr",
+      "resourceGroup": "rg-mysql-dr",
+      "probeResult": {
+        "replicationRole": "Replica",
+        "state": "Ready",
+        "sourceServerResourceId": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-mysql/providers/Microsoft.DBforMySQL/flexibleServers/mysql-anchor"
+      }
+    },
+    {
+      "id": "/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-redis-dr/providers/Microsoft.Cache/Redis/redis-anchor-dr",
+      "type": "Microsoft.Cache/Redis",
+      "name": "redis-anchor-dr",
+      "resourceGroup": "rg-redis-dr",
+      "probeResult": {
+        "provisioningState": "Succeeded",
+        "linkedServers": [
+          { "name": "redis-anchor-primary", "linkedRedisCacheLocation": "West Europe" }
+        ]
+      }
+    }
+  ]
+}
