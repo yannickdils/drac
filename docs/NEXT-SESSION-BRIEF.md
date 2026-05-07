@@ -1,29 +1,44 @@
 # DRaaC — Handoff to next session
 
-> **Purpose.** Onboard a fresh Claude Code (or human) session to pick up the DRaaC implementation. Pair this with [docs/IMPLEMENTATION-LOG.md](IMPLEMENTATION-LOG.md) (per-round detail) and [`C:\Users\04562\Downloads\IMPLEMENTATION-BRIEF.md`](file:///C:/Users/04562/Downloads/IMPLEMENTATION-BRIEF.md) (the spec).
+> **Purpose.** Onboard a fresh Claude Code (or human) session to continue DRaaC work. Pair this with [docs/IMPLEMENTATION-LOG.md](IMPLEMENTATION-LOG.md) (per-round detail) and [`C:\Users\04562\Downloads\IMPLEMENTATION-BRIEF.md`](file:///C:/Users/04562/Downloads/IMPLEMENTATION-BRIEF.md) (the spec).
 
 ---
 
-## 1. State at handoff (2026-05-06, end of Round 4)
+## ✅ Project Complete — All 5 Rounds Done (2026-05-07)
 
-| Round | Status | Commit |
+**All planned implementation work is finished.** 17/17 tests pass. PSScriptAnalyzer: 0 warnings. HEAD is at `49eca3c` (local `main`). `origin/main` is at `26283a6` — a `git push origin main` is pending.
+
+If resuming, start here:
+
+```powershell
+git -C c:/Repos/drac status
+git -C c:/Repos/drac log --oneline -5
+pwsh -NoProfile -Command "& 'C:\Repos\drac\tests\Invoke-Validation.ps1' -Round '1','2','3','4','5'"
+# Must be 17/17 PASS
+```
+
+---
+
+## 1. State at handoff (2026-05-07, end of Round 5)
+
+| Round | Status | Commit(s) |
 |---|---|---|
 | Pre-work — validation harness | Done | `9474601` |
-| Round 1 — Correctness fixes (B1, B2, B3, B4) | Done | `9474601` |
+| Round 1 — Correctness fixes (B1–B4) | Done | `9474601` |
 | `draac-demo/` side track | Done | `8fb83eb` |
 | Round 2 — Loop A close (A1 coverage gate, A2 deploy) | Done | `931cb62` |
 | Round 3 — Loop B open (A3 portal drift sync) | Done | `d047676` |
-| Round 4 — Make DR real (A4, A5, E4) | Done | _this commit_ |
-| Round 5 — Polish (C1, C2, D1–D3, E1–E3, E5) | **Not started — next** | — |
+| Round 4 — Make DR real (A4, A5, E4) | Done | `688873e` |
+| Round 5 — Polish (R5.1–R5.7, C1–C2, E1–E3, E5) | **Done** | `df19df4`, `26283a6`, `49eca3c` |
 
 **Validation gate as of last commit:**
 ```
-pwsh tests/Invoke-Validation.ps1 -Round '1','2','3','4'   →  13/13 PASS
-Invoke-ScriptAnalyzer -Settings PSScriptAnalyzerSettings.psd1
-  Round 1–4 files: 0 issues
-  Pre-existing legacy scripts: 15 warnings (Round 5 D1/D2/D3 will clean these up)
-az bicep build on each of the 9 new Round-4 Bicep modules: all clean
+pwsh tests/Invoke-Validation.ps1 -Round '1','2','3','4','5'  →  17/17 PASS
+Invoke-ScriptAnalyzer -Path scripts/ -Recurse -Settings PSScriptAnalyzerSettings.psd1
+  → 0 warnings/errors
 ```
+
+**Pending:** `git push origin main` (local HEAD `49eca3c` is 3 commits ahead of `origin/main` at `26283a6`).
 
 ---
 
@@ -54,35 +69,9 @@ PSScriptAnalyzer settings file at `PSScriptAnalyzerSettings.psd1` excludes two r
 
 ---
 
-## 3. Round 5 — what's next
+## 3. No pending rounds
 
-**Goal (from the brief §R5).** Lower-priority polish items, each small enough to be a single PR.
-
-**Scope:**
-
-| Sub-section | Files |
-|---|---|
-| **R5.1 / C1** 200-resource RG handling | `scripts/export/Export-LargeResourceGroup.ps1` (new) — Resource Graph enumeration → `az resource show --ids` per resource → aggregate. `scripts/export/export-arm-templates.ps1` is updated to detect RGs >150 resources from scan data and dispatch to the large-RG path. |
-| **R5.2 / C2** Unsupported resource types | `data/unsupported-types.json` (new) — `neverExports` (DataFactory, Classic*) + `partiallyExports` (Logic). Post-export, cross-reference scan results; missing resources of "neverExports" types get logged to `_reports/export/unsupported-resources.json` and surfaced in the compliance comment as `requiresHandAuthoredDR: <count>`. |
-| **R5.3 / D1** Compile-then-match | Replace regex-based name extraction in `match-code-to-deployed.ps1` with `bicep build` → ARM JSON → resolved `resources[].name`. Fall back to fuzzy regex only for ARM expressions that can't be resolved at compile time. |
-| **R5.4 / D2** Tuple matching | In `detect-drift.ps1` and `match-code-to-deployed.ps1`, change matching key from lowercase `name` to `(name, type)` tuple. Optionally include `resourceGroup` when the IaC file's path provides a clear RG hint. |
-| **R5.5 / D3** Delete the `.sh` scripts | Brief calls out shell scripts that should be PowerShell. Delete and re-implement as `.ps1` if still needed. |
-| **R5.6 / E1–E3** Reporting polish | Add the DR-health summary, drift severity, and unsupported-types count to `post-pr-comment.ps1`'s output. |
-| **R5.7 / E5** PSRule for Azure integration | `Install-Module PSRule.Rules.Azure -Force -Scope CurrentUser` then `Invoke-PSRule -Module PSRule.Rules.Azure -InputPath bicep/modules/` as a CI gate. |
-
-**Suggested decomposition for parallel agents:**
-
-- **Agent A — R5.1 + R5.2.** Pure script work. Disjoint from everyone else — `Export-LargeResourceGroup.ps1` + `unsupported-types.json` + the dispatch hook in `export-arm-templates.ps1`.
-- **Agent B — R5.3 + R5.4.** `match-code-to-deployed.ps1` + `detect-drift.ps1` rewrite. These two changes are tightly coupled (tuple keying must match between the two scripts), so one agent owns both. **This rewrite also cleans up the bulk of the 15 legacy PSScriptAnalyzer warnings** carried forward from R1–R3.
-- **Agent C — R5.6 + R5.7.** `post-pr-comment.ps1` polish + PSRule.Rules.Azure integration into the validation harness.
-- **Agent D — R5.5.** Delete the legacy `.sh` files. Trivial; could fold into another agent if the file list is short.
-
-The rewrite of `match-code-to-deployed.ps1` (B) and the report polish (C) can race on `post-pr-comment.ps1` if B chooses to surface the new tuple match into the report. Have B return the new comment-section template text in its agent report and let C integrate it.
-
-**Validation expectations:**
-
-- Pre-existing legacy scripts must drop from 15 warnings to 0 after Agent B lands (D1 + D2 rewrites are the bulk of those files).
-- `Invoke-PSRule -Module PSRule.Rules.Azure -InputPath bicep/modules/` must be clean. Agent C may need to add per-module suppressions or fix the module to satisfy PSRule rules.
+All 5 planned rounds from the implementation brief are complete. If the project resumes, scope future work as a **Round 6** (keeping the same naming convention) and open it as a new section here.
 
 ---
 
