@@ -39,6 +39,11 @@ $DrValidation       = Get-ReportJson (Join-Path $DrDir     "dr-validation-report
 $DrHealthReport     = Get-ReportJson (Join-Path $DrDir     "dr-health-report.json")
 $UnsupportedSummary = if ($ExportDir) { Get-ReportJson (Join-Path $ExportDir "unsupported-summary.json") } else { $null }
 
+# Round 5 §R5.6 / §R5.7 / §R5.8 reports.
+$SlowDriftReport  = Get-ReportJson (Join-Path $ScanDir "slow-drift.json")
+$SkuAvailability  = Get-ReportJson (Join-Path $DrDir   "sku-availability.json")
+$ApiVersionCompat = Get-ReportJson (Join-Path $DrDir   "api-version-compat.json")
+
 # ── Derive status indicators ──────────────────────────────────────────────────
 $DriftCritical          = if ($DriftReport)         { $DriftReport.summary.critical             } else { 0 }
 $DriftWarnings          = if ($DriftReport)         { $DriftReport.summary.warnings             } else { 0 }
@@ -58,9 +63,26 @@ $DrHealthStatus         = if ($DrHealthReport)      { $DrHealthReport.summary.st
 $DrHealthChecks         = if ($DrHealthReport)      { $DrHealthReport.summary.totalChecks       } else { "N/A" }
 $DrHealthPassed         = if ($DrHealthReport)      { $DrHealthReport.summary.passed            } else { "N/A" }
 
-$OverallStatus = if ($DriftCritical -gt 0 -or $Unmatched -gt 0)                { "🔴 Action Required" }
-                 elseif ($DriftWarnings -gt 0 -or $RequiresHandAuthoredDR -gt 0) { "🟡 Review Recommended" }
-                 else                                                              { "🟢 Compliant" }
+# Slow drift (R5.6)
+$SlowDriftAppeared    = if ($SlowDriftReport) { $SlowDriftReport.summary.appeared    } else { 0 }
+$SlowDriftDisappeared = if ($SlowDriftReport) { $SlowDriftReport.summary.disappeared } else { 0 }
+$SlowDriftChanged     = if ($SlowDriftReport) { $SlowDriftReport.summary.changed     } else { 0 }
+$SlowDriftTotal       = if ($SlowDriftReport) { $SlowDriftReport.summary.total       } else { 0 }
+# SKU availability (R5.7)
+$SkuAvailable   = if ($SkuAvailability) { $SkuAvailability.summary.available   } else { 0 }
+$SkuUnavailable = if ($SkuAvailability) { $SkuAvailability.summary.unavailable } else { 0 }
+$SkuNotChecked  = if ($SkuAvailability) { $SkuAvailability.summary.notChecked  } else { 0 }
+# API-version compatibility (R5.8)
+$ApiCompatible   = if ($ApiVersionCompat) { $ApiVersionCompat.summary.compatible   } else { 0 }
+$ApiIncompatible = if ($ApiVersionCompat) { $ApiVersionCompat.summary.incompatible } else { 0 }
+$ApiNotAvailable = if ($ApiVersionCompat) { $ApiVersionCompat.summary.notAvailable } else { 0 }
+
+# A pre-deploy gate is "warning" if any unavailable SKU OR incompatible/notAvailable api version exists.
+$PreDeployWarnings = ($SkuUnavailable + $ApiIncompatible + $ApiNotAvailable) -gt 0
+
+$OverallStatus = if ($DriftCritical -gt 0 -or $Unmatched -gt 0)                              { "🔴 Action Required" }
+                 elseif ($DriftWarnings -gt 0 -or $RequiresHandAuthoredDR -gt 0 -or $PreDeployWarnings -or $SlowDriftTotal -gt 0) { "🟡 Review Recommended" }
+                 else                                                                         { "🟢 Compliant" }
 
 # ── Build markdown comment body ───────────────────────────────────────────────
 $CriticalRows = if ($DriftReport -and $DriftCritical -gt 0) {
@@ -132,13 +154,80 @@ $(if ($DrFail -gt 0) { "> ⚠️ $DrFail DR template(s) failed what-if validatio
 
 ---
 
+### 5️⃣ Pre-deploy DR validators (``$DrRegion``)
+| Check | Status |
+|---|---|
+| SKU availability (avail / unavail / notChecked) | $SkuAvailable / $SkuUnavailable / $SkuNotChecked |
+| API version compatibility (compat / incompat / region-missing) | $ApiCompatible / $ApiIncompatible / $ApiNotAvailable |
+
+$(if ($SkuUnavailable -gt 0 -and $SkuAvailability) {
+    $rows = @($SkuAvailability.results | Where-Object { $_.status -eq 'unavailable' } | Select-Object -First 5) | ForEach-Object {
+      $skuName = if ($_.sku.name) { $_.sku.name } else { $_.sku.tier }
+      $sub = if ($_.suggestedSubstitute) { $_.suggestedSubstitute } else { '—' }
+      "| ``$($_.resource.name)`` | ``$($_.resource.type)`` | $skuName | $sub |"
+    }
+    @"
+**Top unavailable SKUs (max 5):**
+
+| Resource | Type | SKU | Suggested |
+|---|---|---|---|
+$($rows -join "`n")
+"@
+})
+
+$(if (($ApiIncompatible + $ApiNotAvailable) -gt 0 -and $ApiVersionCompat) {
+    $rows = @($ApiVersionCompat.results | Where-Object { $_.status -in @('incompatible','notAvailable') } | Select-Object -First 5) | ForEach-Object {
+      $sug = if ($_.suggestedApiVersion) { $_.suggestedApiVersion } else { '—' }
+      "| ``$($_.resource.type)`` | $($_.apiVersion) | $($_.status) | $sug |"
+    }
+    @"
+**Top API-version issues (max 5):**
+
+| Resource Type | API Version | Status | Suggested |
+|---|---|---|---|
+$($rows -join "`n")
+"@
+})
+
+---
+
+### 6️⃣ Slow drift (since baseline)
+| Bucket | Count |
+|---|---|
+| 🟢 Appeared    | $SlowDriftAppeared |
+| 🔴 Disappeared | $SlowDriftDisappeared |
+| 🟡 Changed     | $SlowDriftChanged |
+| Total          | $SlowDriftTotal |
+
+$(if ($SlowDriftTotal -gt 0 -and $SlowDriftReport) {
+    $rows = @($SlowDriftReport.items | Select-Object -First 5) | ForEach-Object {
+      "| $($_.category) | ``$($_.name)`` | ``$($_.type)`` |"
+    }
+    @"
+**Top slow-drift items (max 5):**
+
+| Bucket | Resource | Type |
+|---|---|---|
+$($rows -join "`n")
+
+> Slow drift compares the current scan against the most recent ``baseline-snapshot.yml`` upload.
+> Read-only properties (etag, provisioningState, …) are stripped before fingerprinting.
+"@
+})
+
+---
+
 ### 📋 Required Actions
 $(if ($DriftCritical -gt 0 -or $Unmatched -gt 0) {
   "- 🚨 **Resolve $DriftCritical critical drift item(s) before merging**`n- Deploy all IaC changes to Azure"
 })
 $(if ($DriftWarnings -gt 0) { "- 👀 Review warning-level items in ``CONFIGURATION-DRIFT.md``" })
 $(if ($RequiresHandAuthoredDR -gt 0) { "- 📝 **$RequiresHandAuthoredDR resource type(s) require hand-authored DR templates** — see unsupported-summary.json" })
-$(if ($TotalDrift -eq 0 -and $Unmatched -eq 0) { "- ✅ All checks passed — safe to merge" })
+$(if ($SkuUnavailable -gt 0)        { "- 🟡 **$SkuUnavailable SKU(s) unavailable in $DrRegion** — review the substitutes table above" })
+$(if ($ApiIncompatible -gt 0)       { "- 🟡 **$ApiIncompatible API version(s) incompatible in $DrRegion** — adopt the suggested versions or pin to a region-supported version" })
+$(if ($ApiNotAvailable -gt 0)       { "- 🟡 **$ApiNotAvailable resource type(s) not available in $DrRegion** — choose a different DR region or remove the type" })
+$(if ($SlowDriftTotal -gt 0)        { "- 🟡 **$SlowDriftTotal slow-drift item(s)** — investigate appeared/disappeared/changed entries above" })
+$(if ($TotalDrift -eq 0 -and $Unmatched -eq 0 -and -not $PreDeployWarnings -and $SlowDriftTotal -eq 0) { "- ✅ All checks passed — safe to merge" })
 
 ---
 *Auto-generated by the DRaaC Pipeline · Updates in place on re-runs*
@@ -165,12 +254,12 @@ $CommentPayload = @{ body = $Comment } | ConvertTo-Json -Compress
 try {
   if ($ExistingCommentId) {
     # Update existing comment (idempotent)
-    $CommentPayload | gh api "repos/$Repo/issues/comments/$ExistingCommentId" \
+    $CommentPayload | gh api "repos/$Repo/issues/comments/$ExistingCommentId" `
       --method PATCH --input - | Out-Null
     Write-Host "SUCCESS: Updated existing PR comment (ID: $ExistingCommentId)"
   } else {
     # Create new comment
-    $CommentPayload | gh api "repos/$Repo/issues/$PrId/comments" \
+    $CommentPayload | gh api "repos/$Repo/issues/$PrId/comments" `
       --method POST --input - | Out-Null
     Write-Host "SUCCESS: Created new PR comment on PR #$PrId"
   }

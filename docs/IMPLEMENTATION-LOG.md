@@ -590,4 +590,47 @@ pwsh tests/bicep-build-all.ps1
 
 ---
 
+## Round 5 follow-up #2 — Wire-ups for the brief's literal language (R4.1 / R4.2 / R5.6 / R5.7 / R5.8)
+
+**Landed 2026-05-07.** Goal: close the five gaps a careful re-read of the brief exposed — items where supporting code existed but wasn't actually wired into the live pipeline / deploy / PR-comment flow.
+
+**Files modified:**
+
+| File | Change |
+|---|---|
+| `scripts/dr/generate-dr-config.ps1` | **R4.1 dispatch consumer.** Calls `Initialize-DefaultDrModuleRegistry` so `Convert-ForDR`'s dispatch records are populated against the live registry. New helper `Write-DispatchedModulesBicep` emits `<rg>-dispatched-modules.bicep` per RG with one `module` block per dispatched resource — references `../../modules/<file>` (resolves cleanly when the file is placed at `bicep/regions/dr/`). Helper `Get-ModuleParam` parses each module file once to discover required params; required params are emitted as `'TODO: <name>'` placeholders with the module's `@description` text inline as a comment so the operator knows what to fill in. `dr-metadata.json` now carries a `dispatched` array; `dr-summary.json` carries `totalDispatched`. Empty catch on the metadata aggregator now logs a warning. |
+| `scripts/dr/deploy-dr-region.ps1` | **R4.2 wired.** After the deploy loop, invokes `Test-DRHealth.ps1 -DeploySummaryFile <summary> -OutputDir <dir> -DrRegion <region>`. Skipped under `-DryRun` and when no deploys succeeded. Health-probe failures are logged as warnings, never fatal — `dr-health.json` is supplementary, not gating. Removed the "deferred to Round 4.2" comment block at the head of the file and the placeholder inside the loop. |
+| `.github/workflows/pr-compliance.yml` | **R5.6 / R5.7 / R5.8 wired into the PR pipeline.** Three new steps: (a) `scan` job runs `Compare-AgainstBaseline.ps1` after the scan (always — script no-ops gracefully when `DRAAC_BASELINE_STORAGE_ACCOUNT` is unset or no baseline exists), writes `slow-drift.json` into the `scan-results` artifact; (b) `disaster-recovery` job runs `Test-SkuAvailability.ps1` and `Test-ApiVersionCompatibility.ps1` against the freshly-generated DR templates, both `continue-on-error: true` so warnings surface in the comment but never fail the workflow. Outputs land in the `dr-config` artifact alongside `sku-availability.json` / `api-version-compat.json`. |
+| `scripts/report/post-pr-comment-github.ps1` | **R5.6 / R5.7 / R5.8 rendered in the PR comment.** Loads the three new report files. Adds two new sections — `5️⃣ Pre-deploy DR validators` (table of SKU + API-version counts; max-5 detail tables for unavailable SKUs and incompatible API versions, with suggested substitutes) and `6️⃣ Slow drift (since baseline)` (counts table + max-5 item table). The `OverallStatus` heuristic now downgrades to "Review Recommended" on any pre-deploy warning or any slow-drift item. The "Required Actions" footer lists each new failure mode with explicit operator hints. **Pre-existing parse bug fixed:** lines 257 / 262 used bash-style `\` line continuations on `gh api` calls; PowerShell rejects this. Replaced with backtick. The script never executed locally (no test ran it), so the bug had been latent since Round 1. |
+| `tests/round-1/Test-GenerateDrConfig-Smoke.ps1` | Extended with five new dispatch assertions: `summary.totalDispatched ≥ 1`, the dispatched `.bicep` file exists for `simple-rg` (which has a Storage Account = registered family), the file references `../../modules/dr-storage.bicep` and contains `targetScope = 'resourceGroup'` and at least one `TODO:` marker, `dr-metadata.json` has a non-empty `dispatched` array. Negative case: `peered-vnet-rg` (no registered families) does NOT get a dispatched bicep file. |
+
+**Bugs caught during validation:**
+
+1. **Emitted dispatched-modules.bicep used the wrong relative module path.** Initial implementation emitted `../../../../bicep/modules/<file>` from `_reports/dr/arm/<sub>/<rg>/`. Bicep tries to resolve modules relative to the SOURCE file, not the repo root, so `../../../../` from a temp report dir lands nowhere. Fix: emit `../../modules/<file>` and document that the file is intended to be checked into `bicep/regions/dr/<rg>-dispatched-modules.bicep` (where the path resolves correctly). The artefact still ships in `dr-config` for operator review; they copy/move into the repo as needed.
+
+2. **Pre-existing `gh api` parse bug.** Lines 257 / 262 of `post-pr-comment-github.ps1` used bash `\` line continuation. PSScriptAnalyzer didn't catch it (its parser is tolerant). Caught by a direct `[Parser]::ParseFile` call on the modified file. Fixed in this commit.
+
+3. **Empty-catch warning from PSScriptAnalyzer.** New `try { ... } catch { }` aggregating dispatched counts across `dr-metadata.json` files. Replaced with `Write-Warning` so silent failures stop hiding.
+
+**Validation:**
+
+```
+pwsh tests/Invoke-Validation.ps1 -Round '1','2','3','4','5'
+Total: 20  Pass: 20  Fail: 0  Elapsed: ~88s
+
+Invoke-ScriptAnalyzer -Path scripts/ -Recurse -Settings PSScriptAnalyzerSettings.psd1
+→ 0 warnings/errors
+
+pwsh tests/bicep-build-all.ps1
+→ Bicep build: 12 succeeded, 0 failed.
+```
+
+**What's still deferred (out of scope for "operationally complete"):**
+
+- **#6 — `setup-github.ps1` branch protection contexts** are still stale (no Stage 3.5 entry, no merge-queue setup). User explicitly scoped this round to #1–#5.
+- **#7 — README Quick Start** still uses bash `export`. Same scoping.
+- Operator-action items (real PR exercise of Stages 1–7, real portal change → portal-sync PR, Front Door failover) — correctly deferred per the brief's intent; require a sandbox subscription.
+
+---
+
 _Log started 2026-05-04. Append, never rewrite history. Every commit that lands a brief item should add an entry here in the same commit._
