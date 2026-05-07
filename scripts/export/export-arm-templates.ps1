@@ -186,8 +186,8 @@ foreach ($Res in $AllResources) {
     }
 }
 
-$NeverCount   = ($UnsupportedResources | Where-Object { $_.exportClass -eq "neverExports"      }).Count
-$PartialCount = ($UnsupportedResources | Where-Object { $_.exportClass -eq "partiallyExports" }).Count
+$NeverCount   = @($UnsupportedResources | Where-Object { $_.exportClass -eq "neverExports"      }).Count
+$PartialCount = @($UnsupportedResources | Where-Object { $_.exportClass -eq "partiallyExports" }).Count
 
 $ReportsDir = Join-Path $OutputDir "_reports" "export"
 $null = New-Item -ItemType Directory -Force -Path $ReportsDir

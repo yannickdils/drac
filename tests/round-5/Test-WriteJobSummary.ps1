@@ -24,6 +24,11 @@ function Assert-Equal { param($Expected, $Actual, [string]$Msg) if ($Expected -n
 Assert-True (Test-Path $SummaryScript) "write-job-summary.ps1 must exist"
 
 function New-TempDir {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Test helper creates an isolated temp directory under $env:TEMP; never mutates system state outside the harness.')]
+    [CmdletBinding()]
+    param()
     $Dir = Join-Path $env:TEMP "draac-summary-$([System.Guid]::NewGuid().ToString('N'))"
     $null = New-Item -ItemType Directory -Force -Path $Dir
     return $Dir

@@ -80,7 +80,7 @@ $NewEntry = @"
 ## PR #$PrId · $SourceBranch · $ReportDate
 
 > **Status:** $StatusBadge  
-> **Pipeline Run:** ``$RunId``  
+> **Pipeline Run:** ``$RunId``
 > **Analysed at:** $Timestamp
 
 ### Summary
@@ -128,8 +128,7 @@ _No entries yet. Run the compliance pipeline to generate the first report._
 }
 
 # ── Upsert: replace existing entry for this PR, or prepend ───────────────────
-$PrAnchor   = "## PR #$PrId ·"
-$HeaderLine = "# Configuration Drift Report"
+$PrAnchor = "## PR #$PrId ·"
 
 if ($Existing -match [regex]::Escape($PrAnchor)) {
   # Replace existing block for this PR
