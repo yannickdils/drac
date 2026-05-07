@@ -16,3 +16,8 @@ dr-config/
 *.bak
 .DS_Store
 Thumbs.db
+
+# Local-only handoff / session notes — never commit
+docs/NEXT-SESSION-BRIEF.md
+docs/*-handoff.md
+docs/*-scratch.md
