@@ -19,8 +19,9 @@
 # Throttling retry: HTTP 429 / ThrottlingException is retried with exponential
 # backoff (5s, 15s, 45s, 135s) before being logged as a permanent failure.
 #
-# Test-DRHealth post-deploy verification is deferred to Round 4.2 — there is a
-# placeholder comment below where its invocation will land.
+# Post-deploy health check (Round 4.2): after the deploy loop, this script
+# invokes scripts/dr/Test-DRHealth.ps1 against the deploy-summary.json so the
+# workflow can surface DR replication state in the PR / job summary.
 #
 # Azure CLI references (latest at time of writing):
 #   az group create:
@@ -301,11 +302,6 @@ foreach ($file in $BicepFiles) {
         $deployPath = Join-Path $OutputDir "deploy-$rg.json"
         $deployResult | Set-Content $deployPath -Encoding UTF8
 
-        # 4. Test-DRHealth invocation point — deferred to Round 4.2.
-        #    When it lands, call:
-        #      & (Join-Path $PSScriptRoot 'Test-DRHealth.ps1') -ResourceGroup $rg -DrRegion $DrRegion
-        #    and merge its result into the deploy-summary.
-
         $DeploymentNames.Add($deployName)
         $Succeeded++
     }
@@ -350,3 +346,35 @@ $summary | ConvertTo-Json -Depth 30 | Set-Content $summaryPath -Encoding UTF8
 Write-Host ""
 Write-Host "DR DEPLOY COMPLETE  Processed: $Processed  Succeeded: $Succeeded  Failed: $Failed"
 Write-Host "  Summary: $summaryPath"
+
+# ── Round 4 §R4.2: post-deploy health probe ─────────────────────────────────
+# Skipped under -DryRun (no Azure to probe) and when no deploys succeeded.
+# Failures are logged but never fatal: the deploy-summary.json is the source
+# of truth; dr-health-report.json is supplementary.
+$healthScript = Join-Path $PSScriptRoot 'Test-DRHealth.ps1'
+if ($DryRun) {
+    Write-Host "  Skipping Test-DRHealth (DryRun)."
+}
+elseif ($Succeeded -eq 0) {
+    Write-Host "  Skipping Test-DRHealth (no successful deploys)."
+}
+elseif (-not (Test-Path $healthScript)) {
+    Write-Warning "  Test-DRHealth.ps1 missing at $healthScript — skipping post-deploy probe."
+}
+else {
+    Write-Host ""
+    Write-Host "── Post-deploy health probe ───────────────────────────────────────────"
+    try {
+        & $healthScript `
+            -DeploySummaryFile $summaryPath `
+            -OutputDir $OutputDir `
+            -DrRegion $DrRegion
+        $healthExit = $LASTEXITCODE
+        if ($healthExit -ne 0) {
+            Write-Warning "  Test-DRHealth exited $healthExit (continuing — see dr-health.json)."
+        }
+    }
+    catch {
+        Write-Warning "  Test-DRHealth invocation failed: $_"
+    }
+}

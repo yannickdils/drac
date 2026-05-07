@@ -102,6 +102,22 @@ jobs:
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
 
+      # Round 5 §R5.6 — slow-drift comparison against the most recent baseline
+      # snapshot uploaded by .github/workflows/baseline-snapshot.yml. The script
+      # gracefully no-ops when DRAAC_BASELINE_STORAGE_ACCOUNT is unset or no
+      # baseline exists yet — emits a slow-drift.json with summary.total = 0.
+      # Non-fatal: items appear in the PR comment but never fail the workflow.
+      - name: Slow drift — compare against baseline
+        continue-on-error: true
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/scan/Compare-AgainstBaseline.ps1 \
+              -CurrentScanDir "${{ env.OUTPUT_DIR }}/scan" \
+              -OutputFile "${{ env.OUTPUT_DIR }}/scan/slow-drift.json" \
+              -StorageAccount "${{ secrets.DRAAC_BASELINE_STORAGE_ACCOUNT }}"
+
       - name: Upload scan results
         uses: actions/upload-artifact@v4
         with:
@@ -412,6 +428,36 @@ jobs:
               -DrDir "${{ env.OUTPUT_DIR }}/dr" \
               -DrRegion "${{ secrets.DR_TARGET_REGION }}" \
               -RunId "${{ env.RUN_ID }}"
+
+      # Round 5 §R5.7 — pre-deploy SKU availability check. Non-fatal:
+      # mismatches surface in the PR comment as warnings. Sets
+      # SKU_AVAILABILITY_OK / SKU_AVAILABILITY_SUMMARY on $GITHUB_OUTPUT.
+      - name: SKU availability check (DR region)
+        id: sku-availability
+        uses: azure/cli@v2
+        continue-on-error: true
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/dr/Test-SkuAvailability.ps1 \
+              -DrConfigDir "${{ env.OUTPUT_DIR }}/dr/arm" \
+              -DrRegion "${{ secrets.DR_TARGET_REGION }}" \
+              -OutputFile "${{ env.OUTPUT_DIR }}/dr/sku-availability.json"
+
+      # Round 5 §R5.8 — pre-deploy API-version compatibility check. Non-fatal:
+      # incompatibilities surface in the PR comment as warnings. Sets
+      # API_VERSION_COMPAT_OK / API_VERSION_COMPAT_SUMMARY on $GITHUB_OUTPUT.
+      - name: API-version compatibility check (DR region)
+        id: api-version-compat
+        uses: azure/cli@v2
+        continue-on-error: true
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/dr/Test-ApiVersionCompatibility.ps1 \
+              -DrConfigDir "${{ env.OUTPUT_DIR }}/dr/arm" \
+              -DrRegion "${{ secrets.DR_TARGET_REGION }}" \
+              -OutputFile "${{ env.OUTPUT_DIR }}/dr/api-version-compat.json"
 
       - name: Upload DR configuration
         uses: actions/upload-artifact@v4

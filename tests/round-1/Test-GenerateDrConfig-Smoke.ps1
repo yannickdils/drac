@@ -72,6 +72,34 @@ try {
     Assert-True ($summary.processed -eq $rgs.Count) "smoke: summary.processed == $($rgs.Count)"
     Assert-True ($summary.failed    -eq 0)          'smoke: summary.failed == 0'
     Assert-True ($summary.transform -eq 'ConvertForDR.psm1') 'smoke: summary.transform identifies the module'
+
+    # Round 4 §R4.1 dispatch consumer assertions:
+    # simple-rg fixture has a Microsoft.Storage/storageAccounts (registered family),
+    # so it must produce a dispatched-modules Bicep file and a non-empty dispatched array.
+    Assert-True ($null -ne $summary.PSObject.Properties['totalDispatched']) "smoke: summary has totalDispatched field"
+    Assert-True ($summary.totalDispatched -ge 1) "smoke: at least one dispatched resource (storage in simple-rg)"
+
+    $simpleDrRg     = 'dr-simple-rg'
+    $simpleDispatch = Join-Path $OutputDir "arm" $SubId $simpleDrRg "$simpleDrRg-dispatched-modules.bicep"
+    Assert-True (Test-Path $simpleDispatch) "smoke: $simpleDrRg-dispatched-modules.bicep exists"
+    if (Test-Path $simpleDispatch) {
+        $bicep = Get-Content $simpleDispatch -Raw
+        Assert-True ($bicep -match "module .+'\.\./\.\./modules/dr-storage\.bicep'") "smoke: dispatched bicep references dr-storage.bicep at canonical path"
+        Assert-True ($bicep -match 'targetScope = ''resourceGroup''') "smoke: dispatched bicep declares resourceGroup scope"
+        Assert-True ($bicep -match 'TODO:') "smoke: dispatched bicep contains TODO markers for operator review"
+    }
+
+    $metaPath = Join-Path $OutputDir "arm" $SubId $simpleDrRg 'dr-metadata.json'
+    if (Test-Path $metaPath) {
+        $meta = Get-Content $metaPath -Raw | ConvertFrom-Json
+        Assert-True ($null -ne $meta.PSObject.Properties['dispatched']) "smoke: dr-metadata.json has dispatched array"
+        Assert-True (@($meta.dispatched).Count -ge 1) "smoke: dr-metadata.json dispatched array non-empty for simple-rg"
+    }
+
+    # peered-vnet-rg has no registered-family resources — must NOT produce a dispatched bicep file.
+    $peeredDrRg     = 'dr-peered-vnet-rg'
+    $peeredDispatch = Join-Path $OutputDir "arm" $SubId $peeredDrRg "$peeredDrRg-dispatched-modules.bicep"
+    Assert-True (-not (Test-Path $peeredDispatch)) "smoke: peered-vnet-rg has no registered families → no dispatched bicep emitted"
 }
 finally {
     if (Test-Path $Workdir) { Remove-Item -Recurse -Force $Workdir -ErrorAction SilentlyContinue }
