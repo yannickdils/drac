@@ -71,21 +71,21 @@
 ## Quick Start
 
 ### Azure DevOps
-```bash
-export ADO_ORG="https://dev.azure.com/your-org"
-export ADO_PROJECT="your-project"
-export ADO_PAT="your-pat-token"
+```powershell
+$env:ADO_ORG     = "https://dev.azure.com/your-org"
+$env:ADO_PROJECT = "your-project"
+$env:ADO_PAT     = "your-pat-token"
 ./setup.ps1
 ```
 Then update the `azure-compliance-pipeline-secrets` variable group in the ADO Library.
 
 ### GitHub Actions
-```bash
-export GITHUB_REPO="your-org/your-repo"
-export AZURE_SUBSCRIPTION_IDS="sub-id-1,sub-id-2"
-export DR_TARGET_REGION="northeurope"
-export DR_VNET_ADDRESS_PREFIX="10.1.0.0/16"
-export DR_SUBNET_ADDRESS_PREFIX="10.1.0.0/24"
+```powershell
+$env:GITHUB_REPO              = "your-org/your-repo"
+$env:AZURE_SUBSCRIPTION_IDS   = "sub-id-1,sub-id-2"
+$env:DR_TARGET_REGION         = "northeurope"
+$env:DR_VNET_ADDRESS_PREFIX   = "10.1.0.0/16"
+$env:DR_SUBNET_ADDRESS_PREFIX = "10.1.0.0/24"
 ./setup-github.ps1
 ```
 Creates the App Registration, configures OIDC federated credentials, assigns Azure roles, and sets all repository secrets automatically.

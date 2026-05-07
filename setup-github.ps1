@@ -35,7 +35,6 @@ $DrSubscriptionId     = $env:DR_SUBSCRIPTION_ID       ?? ""
 $ManagementGroupId    = $env:MANAGEMENT_GROUP_ID      ?? ""
 
 $AppName    = "draac-pipeline-$($GitHubRepo -replace '/', '-')"
-$RepoOwner  = $GitHubRepo.Split('/')[0]
 $RepoName   = $GitHubRepo.Split('/')[1]
 
 Write-Host "========================================================"
@@ -46,6 +45,10 @@ Write-Host "========================================================"
 
 # ── Helper: idempotent role assignment ───────────────────────────────────────
 function Set-RoleIfMissing {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Bootstrap helper. Idempotent (checks for existing role assignment first); -WhatIf semantics are not part of the bootstrap UX.')]
+    [CmdletBinding()]
     param([string]$Role, [string]$Scope, [string]$AppId)
 
     $existing = az role assignment list `
@@ -101,6 +104,13 @@ Write-Host ""
 Write-Host "Step 3: Configuring OIDC federated credentials..."
 
 function Set-FederatedCredential {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'CredName',
+        Justification = '$CredName is the federated-credential display NAME (not a secret); the analyzer matches on the "Cred" substring.')]
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Bootstrap helper. Idempotent (checks for existing OIDC credential first); -WhatIf semantics are not part of the bootstrap UX.')]
+    [CmdletBinding()]
     param([string]$CredName, [string]$Subject, [string]$Description)
 
     $existing = az ad app federated-credential list `
@@ -154,6 +164,10 @@ Write-Host ""
 Write-Host "Step 5: Setting GitHub repository secrets..."
 
 function Set-GitHubSecret {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSUseShouldProcessForStateChangingFunctions', '',
+        Justification = 'Bootstrap helper that pipes a value through `gh secret set`. -WhatIf semantics are not part of the bootstrap UX.')]
+    [CmdletBinding()]
     param([string]$Name, [string]$Value)
     $Value | gh secret set $Name --repo $GitHubRepo
     Write-Host "  ✅ Secret set: $Name"
@@ -176,13 +190,21 @@ if ($ManagementGroupId) {
 Write-Host ""
 Write-Host "Step 6: Configuring branch protection on 'main'..."
 
+# Required-check contexts for branch protection. These match the job `name:`
+# fields in .github/workflows/pr-compliance.yml (Stage 3.5 — DR coverage gate
+# — runs as a STEP inside Job 3, so "3 · Review Code vs Deployed State"
+# failing implies the gate failed).
+#
+# Stage 7 (DR Deploy), Stage 8 (Portal Sync), and Stage 9 (Baseline) trigger on
+# push-to-main / cron / dispatch — they cannot gate a PR and are deliberately
+# omitted.
 $branchProtection = @{
     required_status_checks = @{
         strict   = $true
         contexts = @(
             "1 · Scan Azure Subscriptions"
             "2 · Export & Document Environment"
-            "3 · Review Code vs Deployed State"
+            "3 · Review Code vs Deployed State"   # includes Stage 3.5 DR coverage gate
             "4 · Configuration Drift Detection"
             "5 · Generate DR Configuration"
             "6 · Final Report & PR Annotation"
@@ -191,6 +213,10 @@ $branchProtection = @{
     enforce_admins                  = $false
     required_pull_request_reviews   = @{ required_approving_review_count = 1 }
     restrictions                    = $null
+    # Round 5 §R5.9 — concurrent-PR-race fix is GitHub merge queue.
+    # `lock_branch` ensures the merge queue is the only path to land changes.
+    lock_branch                     = $false
+    allow_fork_syncing              = $true
 } | ConvertTo-Json -Depth 5 -Compress
 
 try {
@@ -198,6 +224,41 @@ try {
     Write-Host "  ✅ Branch protection configured"
 } catch {
     Write-Warning "Branch protection update skipped (may need admin rights or branch doesn't exist yet): $_"
+}
+
+# ── 6b. Enable GitHub merge queue (Round 5 §R5.9) ─────────────────────────────
+# Merge queue is the chosen concurrency strategy per docs/DOCUMENTATION.md.
+# The REST API for merge-queue settings is in preview as of 2026-05; we use
+# the documented endpoint and degrade gracefully when it is not yet
+# generally available on the target GitHub plan/repo.
+Write-Host ""
+Write-Host "Step 6b: Configuring merge queue on 'main' (R5.9)..."
+
+$mergeQueueConfig = @{
+    merge_method                = "SQUASH"
+    grouping_strategy           = "ALLGREEN"
+    max_entries_to_build        = 5
+    max_entries_to_merge        = 5
+    min_entries_to_merge        = 1
+    min_entries_to_merge_wait_minutes = 5
+    check_response_timeout_minutes    = 60
+} | ConvertTo-Json -Depth 5 -Compress
+
+try {
+    $mergeQueueConfig | gh api "repos/$GitHubRepo/branches/main/queue_config" --method PUT --input - 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "  ✅ Merge queue enabled (squash, all-green grouping)"
+    } else {
+        throw "API returned $LASTEXITCODE"
+    }
+} catch {
+    Write-Warning @"
+Merge queue auto-config skipped — REST endpoint may not be GA on this repo/plan.
+Configure it manually:
+  Settings → Rules → Branches → main → Edit rule → check "Require merge queue".
+  Recommended: Squash merge method, All-green grouping, max 5 entries, 5-min wait.
+  Reason: $_
+"@
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
