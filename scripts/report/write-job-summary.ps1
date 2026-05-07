@@ -9,28 +9,36 @@ param(
   [Parameter(Mandatory)][string] $ReviewDir,
   [Parameter(Mandatory)][string] $DriftDir,
   [Parameter(Mandatory)][string] $DrDir,
-  [Parameter(Mandatory)][string] $SummaryFile
+  [Parameter(Mandatory)][string] $SummaryFile,
+  [string] $ExportDir = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Continue"
 
-function Load-Json($path) {
+function Get-ReportJson($path) {
   if (Test-Path $path) { return Get-Content $path -Raw | ConvertFrom-Json }
   return $null
 }
 
-$ScanSummary  = Load-Json (Join-Path $ScanDir   "scan-summary.json")
-$MatchReport  = Load-Json (Join-Path $ReviewDir "deployment-match-report.json")
-$DriftReport  = Load-Json (Join-Path $DriftDir  "drift-report.json")
-$DrSummary    = Load-Json (Join-Path $DrDir     "dr-summary.json")
-$DrValidation = Load-Json (Join-Path $DrDir     "dr-validation-report.json")
+$ScanSummary  = Get-ReportJson (Join-Path $ScanDir   "scan-summary.json")
+$MatchReport  = Get-ReportJson (Join-Path $ReviewDir "deployment-match-report.json")
+$DriftReport  = Get-ReportJson (Join-Path $DriftDir  "drift-report.json")
+$DrSummary    = Get-ReportJson (Join-Path $DrDir     "dr-summary.json")
+$DrValidation = Get-ReportJson (Join-Path $DrDir     "dr-validation-report.json")
+$DrHealthReport     = Get-ReportJson (Join-Path $DrDir "dr-health-report.json")
+$UnsupportedSummary = if ($ExportDir) { Get-ReportJson (Join-Path $ExportDir "unsupported-summary.json") } else { $null }
 
-$DriftCritical = if ($DriftReport) { $DriftReport.summary.critical  } else { 0 }
-$DriftWarnings = if ($DriftReport) { $DriftReport.summary.warnings  } else { 0 }
-$Coverage      = if ($MatchReport) { $MatchReport.summary.deploymentCoverage } else { "N/A" }
-$DrRegion      = if ($DrSummary)   { $DrSummary.drRegion    } else { "N/A" }
-$DrGenerated   = if ($DrSummary)   { $DrSummary.processed   } else { 0 }
+$DriftCritical          = if ($DriftReport)         { $DriftReport.summary.critical             } else { 0 }
+$DriftWarnings          = if ($DriftReport)         { $DriftReport.summary.warnings             } else { 0 }
+$Coverage               = if ($MatchReport)         { $MatchReport.summary.deploymentCoverage   } else { "N/A" }
+$DrRegion               = if ($DrSummary)           { $DrSummary.drRegion                       } else { "N/A" }
+$DrGenerated            = if ($DrSummary)           { $DrSummary.processed                      } else { 0 }
+$DriftSeverity          = if ($DriftCritical -gt 0) { "critical" } elseif ($DriftWarnings -gt 0) { "warning" } else { "ok" }
+$DrHealthStatus         = if ($DrHealthReport)      { $DrHealthReport.summary.status            } else { "N/A" }
+$DrHealthChecks         = if ($DrHealthReport)      { $DrHealthReport.summary.totalChecks       } else { "N/A" }
+$DrHealthPassed         = if ($DrHealthReport)      { $DrHealthReport.summary.passed            } else { "N/A" }
+$RequiresHandAuthoredDR = if ($UnsupportedSummary)  { $UnsupportedSummary.requiresHandAuthoredDR } else { 0 }
 
 $StatusEmoji = if ($DriftCritical -gt 0) { "🔴" } elseif ($DriftWarnings -gt 0) { "🟡" } else { "🟢" }
 
@@ -55,6 +63,7 @@ $Summary = @"
 |---|---|
 | 🔴 Critical | $DriftCritical |
 | 🟡 Warning  | $DriftWarnings |
+| Overall Severity | $DriftSeverity |
 
 ## DR Configuration → ``$DrRegion``
 | Metric | Value |
@@ -62,6 +71,9 @@ $Summary = @"
 | Templates generated | $DrGenerated |
 | Validation passed   | $(if ($DrValidation) { $DrValidation.validationSummary.passed } else { 'N/A' }) |
 | Validation failed   | $(if ($DrValidation) { $DrValidation.validationSummary.failed } else { 'N/A' }) |
+| DR health status    | $DrHealthStatus |
+| Health checks passed | $DrHealthPassed / $DrHealthChecks |
+| Requires hand-authored DR | $RequiresHandAuthoredDR |
 "@
 
 Add-Content -Path $SummaryFile -Value $Summary

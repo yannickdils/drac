@@ -1,3 +1,4 @@
+﻿#Requires -Version 7.2
 # =============================================================================
 # detect-drift.ps1
 # Stage 4a: Compare deployed Azure state with IaC code to detect config drift.
@@ -7,7 +8,6 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $ScanDir,
-    [Parameter(Mandatory)] [string] $ExportDir,
     [Parameter(Mandatory)] [string] $ReviewDir,
     [Parameter(Mandatory)] [string] $RepoRoot,
     [Parameter(Mandatory)] [string] $OutputDir,
@@ -36,13 +36,34 @@ Write-Host "INFO: Scanning repository IaC files in $RepoRoot"
 
 $CodeResources = [System.Collections.Generic.List[hashtable]]::new()
 
-# Bicep files
+# Bicep files — try compile-then-match, fall back to regex
+$bicepPattern = 'name:\s*[\x27\x22]([^\x27\x22\[\$\n]{2,})[\x27\x22]'
 Get-ChildItem -Path $RepoRoot -Recurse -Include "*.bicep" -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -notmatch '\.git' } |
     ForEach-Object {
-        $content = Get-Content $_.FullName -Raw
-        foreach ($m in [regex]::Matches($content, "name:\s*['\`"]([^'\`"\[\$\n]{2,})['\`"]")) {
-            $CodeResources.Add(@{ name = $m.Groups[1].Value.Trim(); source = "bicep"; file = $_.FullName })
+        $bicepFile = $_
+        $compiled  = $false
+        $azCmd     = Get-Command 'az' -ErrorAction SilentlyContinue
+        if ($azCmd) {
+            try {
+                $armJson = az bicep build --stdout --file $bicepFile.FullName 2>$null
+                if ($LASTEXITCODE -eq 0 -and $armJson) {
+                    $tpl = $armJson | ConvertFrom-Json -ErrorAction Stop
+                    foreach ($r in $tpl.resources) {
+                        if ($r.name -and $r.name -notmatch '^\[') {
+                            $rType = if ($r.PSObject.Properties['type']) { "$($r.type)" } else { '' }
+                            $CodeResources.Add(@{ name = $r.name; type = $rType; source = 'bicep'; file = $bicepFile.FullName })
+                        }
+                    }
+                    $compiled = $true
+                }
+            } catch { Write-Verbose "bicep build failed for $($bicepFile.FullName): $_" }
+        }
+        if (-not $compiled) {
+            $src = Get-Content $bicepFile.FullName -Raw
+            foreach ($m in [regex]::Matches($src, $bicepPattern)) {
+                $CodeResources.Add(@{ name = $m.Groups[1].Value.Trim(); type = ''; source = 'bicep'; file = $bicepFile.FullName })
+            }
         }
     }
 
@@ -51,28 +72,37 @@ Get-ChildItem -Path $RepoRoot -Recurse -Include "*.json" -ErrorAction SilentlyCo
     Where-Object { $_.FullName -notmatch '\.git' -and $_.FullName -match '(arm|template|deploy)' } |
     Select-Object -First 100 |
     ForEach-Object {
+        $armFile = $_
         try {
-            $tpl = Get-Content $_.FullName -Raw | ConvertFrom-Json -ErrorAction Stop
-            foreach ($r in $tpl.resources) {
-                if ($r.name -and $r.name -notmatch '^\[') {
-                    $CodeResources.Add(@{ name = $r.name; source = "arm"; file = $_.FullName })
+            $tpl = Get-Content $armFile.FullName -Raw | ConvertFrom-Json -ErrorAction Stop
+            if ($tpl.PSObject.Properties['resources']) {
+                foreach ($r in $tpl.resources) {
+                    if ($r.name -and $r.name -notmatch '^\[') {
+                        $rType = if ($r.PSObject.Properties['type']) { "$($r.type)" } else { '' }
+                        $CodeResources.Add(@{ name = $r.name; type = $rType; source = 'arm'; file = $armFile.FullName })
+                    }
                 }
             }
-        } catch {}
+        } catch { Write-Verbose "Skipping $($armFile.FullName): $_" }
     }
 
 # PowerShell files
+$psPattern = '-Name\s+[\x27\x22]([^\x27\x22\n]{2,})[\x27\x22]'
 Get-ChildItem -Path $RepoRoot -Recurse -Include "*.ps1","*.psm1" -ErrorAction SilentlyContinue |
     Where-Object { $_.FullName -notmatch '\.git' } |
     ForEach-Object {
-        $content = Get-Content $_.FullName -Raw
-        foreach ($m in [regex]::Matches($content, '-Name\s+["\x27]([^"'\x27\n]{2,})["\x27]')) {
-            $CodeResources.Add(@{ name = $m.Groups[1].Value.Trim(); source = "powershell"; file = $_.FullName })
+        $psFile  = $_
+        $src2    = Get-Content $psFile.FullName -Raw
+        foreach ($m in [regex]::Matches($src2, $psPattern)) {
+            $CodeResources.Add(@{ name = $m.Groups[1].Value.Trim(); type = ''; source = 'powershell'; file = $psFile.FullName })
         }
     }
 
-# Deduplicate by name
-$UniqueCode = $CodeResources | Sort-Object { $_.name } | Group-Object { $_.name } | ForEach-Object { $_.Group[0] }
+# Deduplicate by (name, type) tuple
+$UniqueCode = $CodeResources |
+    Sort-Object   { "$($_['name'])|$($_['type'])" } |
+    Group-Object  { "$($_['name'].ToLower())|$($_['type'].ToLower())" } |
+    ForEach-Object { $_.Group[0] }
 Write-Host "INFO: Extracted $($UniqueCode.Count) resource declarations from code"
 
 # ── Exclusion list (system-managed resources) ─────────────────────────────────
@@ -87,15 +117,18 @@ $CodeNotDeployed     = 0
 # 1. Resources in Azure NOT in code
 foreach ($Resource in $AllResources) {
     $RName = $Resource.name
-    $RType = $Resource.type
+    $RType = if ($Resource.PSObject.Properties['type']) { "$($Resource.type)" } else { '' }
 
-    # Skip system resources
     $skip = $false
     foreach ($pat in $ExcludePatterns) { if ($RName -match $pat) { $skip = $true; break } }
     if ($skip) { continue }
     if ($RType -like "*extensions*") { continue }
 
-    $InCode = @($UniqueCode | Where-Object { $_.name.ToLower() -eq $RName.ToLower() }).Count
+    # Match by (name, type) — if code entry has no type, name-only is sufficient
+    $InCode = @($UniqueCode | Where-Object {
+        $_['name'].ToLower() -eq $RName.ToLower() -and
+        ($_['type'] -eq '' -or $_['type'].ToLower() -eq $RType.ToLower())
+    }).Count
     if ($InCode -eq 0) {
         $DeployedNotInCode++
         $DriftItems.Add([ordered]@{
@@ -103,9 +136,9 @@ foreach ($Resource in $AllResources) {
             severity       = "warning"
             resourceName   = $RName
             resourceType   = $RType
-            location       = $Resource.location
-            resourceGroup  = $Resource.resourceGroup
-            subscriptionId = $Resource.subscriptionId
+            location       = if ($Resource.PSObject.Properties['location']) { $Resource.location } else { '' }
+            resourceGroup  = if ($Resource.PSObject.Properties['resourceGroup']) { $Resource.resourceGroup } else { '' }
+            subscriptionId = if ($Resource.PSObject.Properties['subscriptionId']) { $Resource.subscriptionId } else { '' }
             description    = "Resource exists in Azure but has no corresponding IaC definition"
             recommendation = "Add IaC definition or mark as manually managed"
         })
@@ -116,15 +149,18 @@ foreach ($Resource in $AllResources) {
 
 # 2. Resources in code NOT deployed in Azure
 foreach ($CodeRes in $UniqueCode) {
-    $Found = @($AllResources | Where-Object { $_.name -and $_.name.ToLower() -eq $CodeRes.name.ToLower() }).Count
+    $Found = @($AllResources | Where-Object {
+        $_.name -and $_.name.ToLower() -eq $CodeRes['name'].ToLower() -and
+        ($CodeRes['type'] -eq '' -or ($_.type -and $_.type.ToLower() -eq $CodeRes['type'].ToLower()))
+    }).Count
     if ($Found -eq 0) {
         $CodeNotDeployed++
         $DriftItems.Add([ordered]@{
             driftType      = "in-code-not-deployed"
             severity       = "critical"
-            resourceName   = $CodeRes.name
-            source         = $CodeRes.source
-            file           = $CodeRes.file
+            resourceName   = $CodeRes['name']
+            source         = $CodeRes['source']
+            file           = $CodeRes['file']
             description    = "IaC defines this resource but it is not found in any Azure subscription"
             recommendation = "Deploy the resource or remove the IaC definition if obsolete"
         })
@@ -178,7 +214,7 @@ $WarningDrift  = ($DriftItems | Where-Object { $_.severity -eq "warning"  }).Cou
         inCodeNotDeployed  = $CodeNotDeployed
     }
     driftItems = $DriftItems
-} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $OutputDir "drift-report.json") -Encoding UTF8
+} | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $OutputDir "drift-report.json") -Encoding UTF8
 
 Write-Host ""
 Write-Host "DRIFT DETECTION COMPLETE"
