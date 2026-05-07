@@ -66,7 +66,7 @@ param skuTier string = 'GeneralPurpose'
 ])
 param postgresVersion string = '16'
 
-@description('Storage size in GB. Must be ≥ the primary.')
+@description('Storage size in GB. Must be at least as large as the primary.')
 @minValue(32)
 param storageSizeGB int = 128
 

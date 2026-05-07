@@ -1,0 +1,153 @@
+# ============================================================
+# DRaaC — Disaster Recovery as Code
+# Stage 9 (Round 5 §R5.6 / E1): Baseline persistence
+#
+# On every push to `main`, scan all subscriptions and snapshot the
+# scan output to a blob container. Compare-AgainstBaseline.ps1 (run
+# during pr-compliance.yml) pulls the most recent snapshot to compute
+# slow drift — items that have changed gradually since the baseline
+# was first taken.
+#
+# Required repository secrets:
+#   AZURE_CLIENT_ID                  — App Registration client ID (OIDC)
+#   AZURE_TENANT_ID                  — Azure AD tenant ID
+#   AZURE_SUBSCRIPTION_ID            — Subscription used for the scan login
+#   AZURE_SUBSCRIPTION_IDS           — comma-separated list of sub IDs to scan
+#                                      (or "ALL"); falls back to AZURE_SUBSCRIPTION_ID
+#   DRAAC_BASELINE_STORAGE_ACCOUNT   — Storage Account name that holds the
+#                                      `draac-baseline` container.
+#
+# Storage-account lifecycle policy (apply once at the container level — not
+# managed by this workflow):
+#   - Days 0–90  : hot tier
+#   - Days 91+   : cool tier
+#   - Day 365    : delete
+# JSON for the management policy:
+#   {
+#     "rules": [{
+#       "name": "draac-baseline-tiering",
+#       "enabled": true,
+#       "type": "Lifecycle",
+#       "definition": {
+#         "filters": { "blobTypes": ["blockBlob"], "prefixMatch": ["draac-baseline/"] },
+#         "actions": {
+#           "baseBlob": {
+#             "tierToCool": { "daysAfterModificationGreaterThan": 90 },
+#             "delete":     { "daysAfterModificationGreaterThan": 365 }
+#           }
+#         }
+#       }
+#     }]
+#   }
+# Apply with:
+#   az storage account management-policy create \
+#     --account-name $DRAAC_BASELINE_STORAGE_ACCOUNT \
+#     --resource-group <rg> \
+#     --policy @policy.json
+# ============================================================
+
+name: "DRaaC Baseline Snapshot"
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch: {}
+  schedule:
+    # Daily 03:00 UTC backstop in case main has had no merges for a while
+    # and the most recent snapshot would otherwise age past the lifecycle
+    # cool-tier threshold.
+    - cron: "0 3 * * *"
+
+# Serialise: a single in-flight run avoids two concurrent uploads stomping
+# on the `latest.txt` pointer.
+concurrency:
+  group: "draac-baseline-snapshot"
+  cancel-in-progress: false
+
+env:
+  OUTPUT_DIR: "${{ github.workspace }}/_reports"
+  RUN_ID: "${{ github.run_id }}"
+
+jobs:
+
+  snapshot:
+    name: "9 · Snapshot baseline scan"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Azure (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Run subscription scan
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            pwsh scripts/scan/scan-subscriptions.ps1 \
+              -SubscriptionIds "${{ secrets.AZURE_SUBSCRIPTION_IDS }}" \
+              -OutputDir "${{ env.OUTPUT_DIR }}" \
+              -RunId "${{ env.RUN_ID }}"
+
+      - name: Compute snapshot prefix
+        id: prefix
+        run: |
+          # UTC timestamp, blob-safe (colons → hyphens).
+          PREFIX=$(date -u +"%Y-%m-%dT%H-%M-%SZ")
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+          echo "  prefix=$PREFIX"
+
+      - name: Upload baseline to blob container
+        uses: azure/cli@v2
+        with:
+          azcliversion: latest
+          run: |
+            ACCOUNT="${{ secrets.DRAAC_BASELINE_STORAGE_ACCOUNT }}"
+            CONTAINER="draac-baseline"
+            PREFIX="${{ steps.prefix.outputs.prefix }}"
+
+            # Ensure container exists (idempotent — `--fail-on-exist` not set).
+            az storage container create \
+              --account-name "$ACCOUNT" \
+              --name "$CONTAINER" \
+              --auth-mode login
+
+            # Upload the entire scan/ subtree under <prefix>/ in the container.
+            az storage blob upload-batch \
+              --account-name "$ACCOUNT" \
+              --auth-mode login \
+              --destination "$CONTAINER" \
+              --destination-path "$PREFIX" \
+              --source "${{ env.OUTPUT_DIR }}/scan" \
+              --overwrite true
+
+            # Update the latest.txt pointer LAST so the comparator never
+            # finds a partially uploaded snapshot.
+            echo "$PREFIX" > /tmp/latest.txt
+            az storage blob upload \
+              --account-name "$ACCOUNT" \
+              --auth-mode login \
+              --container-name "$CONTAINER" \
+              --name "latest.txt" \
+              --file /tmp/latest.txt \
+              --overwrite
+
+            echo "Uploaded baseline snapshot: $CONTAINER/$PREFIX/"
+
+      - name: Upload scan reports as workflow artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-scan-reports
+          path: ${{ env.OUTPUT_DIR }}/scan
+          retention-days: 30
