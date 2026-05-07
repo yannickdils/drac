@@ -633,4 +633,17 @@ pwsh tests/bicep-build-all.ps1
 
 ---
 
+## Round 5 follow-up #3 — Polish gaps (#6 setup-github.ps1, #7 README Quick Start)
+
+**Landed 2026-05-07.** Closes the two low-priority gaps deferred from the previous wire-up commit. No behaviour changes to the live pipeline.
+
+| File | Change |
+|---|---|
+| `README.md` | Quick Start blocks now use PowerShell `$env:` syntax instead of bash `export`. Aligns with project rule #1 (PowerShell 7.2+ only). |
+| `setup-github.ps1` | Branch-protection contexts list gets explanatory comments — Stage 3.5 (DR coverage gate) is covered by Job 3's required check since it runs as a step inside it; Stages 7/8/9 are deliberately omitted because they trigger on push/cron/dispatch and cannot gate a PR. New Step 6b enables GitHub merge queue per Round 5 §R5.9 (chosen concurrency strategy) via `PUT /repos/.../branches/main/queue_config`; degrades gracefully with manual-setup instructions when the REST endpoint is not yet GA on the target plan. Removed unused `$RepoOwner` declaration. Added `[Diagnostics.CodeAnalysis.SuppressMessageAttribute]` blocks to `Set-RoleIfMissing` / `Set-FederatedCredential` / `Set-GitHubSecret` (state-changing helpers — `-WhatIf` semantics are not part of the bootstrap UX). Added a `PSAvoidUsingPlainTextForPassword` suppression on `Set-FederatedCredential.$CredName` (false positive — `CredName` is the federated-credential display name, not a secret). |
+
+**Validation:** `Invoke-Validation.ps1` 20/20 pass; `Invoke-ScriptAnalyzer -Path scripts/` 0 issues; **`Invoke-ScriptAnalyzer -Path setup-github.ps1` 0 issues** (this file was never previously analyzed because the project's analyzer pass scopes to `scripts/` only — the warnings surfaced via IDE diagnostics on edit and are now resolved).
+
+---
+
 _Log started 2026-05-04. Append, never rewrite history. Every commit that lands a brief item should add an entry here in the same commit._
