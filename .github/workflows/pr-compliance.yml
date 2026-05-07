@@ -233,7 +233,6 @@ jobs:
             pwsh scripts/review/match-code-to-deployed.ps1 \
               -PrChangesFile "${{ env.OUTPUT_DIR }}/review/pr-changes.json" \
               -ScanDir "${{ env.OUTPUT_DIR }}/scan" \
-              -ExportDir "${{ env.OUTPUT_DIR }}/export" \
               -OutputDir "${{ env.OUTPUT_DIR }}/review" \
               -RunId "${{ env.RUN_ID }}"
 
@@ -316,7 +315,6 @@ jobs:
           run: |
             pwsh scripts/drift/detect-drift.ps1 \
               -ScanDir "${{ env.OUTPUT_DIR }}/scan-results" \
-              -ExportDir "${{ env.OUTPUT_DIR }}/export-results" \
               -ReviewDir "${{ env.OUTPUT_DIR }}/review-results" \
               -RepoRoot "${{ github.workspace }}" \
               -OutputDir "${{ env.OUTPUT_DIR }}/drift" \

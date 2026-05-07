@@ -1,0 +1,17 @@
+{
+  "_comment": "Resource types that ARM export handles poorly. Used by export-arm-templates.ps1 to annotate unsupported-summary.json after export.",
+  "neverExports": [
+    "Microsoft.DataFactory/factories",
+    "Microsoft.DataFactory/factories/pipelines",
+    "Microsoft.DataFactory/factories/datasets",
+    "Microsoft.DataFactory/factories/linkedServices",
+    "Microsoft.ClassicCompute/domainNames",
+    "Microsoft.ClassicCompute/virtualMachines",
+    "Microsoft.ClassicNetwork/virtualNetworks",
+    "Microsoft.ClassicNetwork/networkSecurityGroups",
+    "Microsoft.ClassicStorage/storageAccounts"
+  ],
+  "partiallyExports": [
+    "Microsoft.Logic/workflows"
+  ]
+}

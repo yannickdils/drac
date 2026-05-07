@@ -14,7 +14,8 @@ param(
   [Parameter(Mandatory)][string] $PrId,
   [Parameter(Mandatory)][string] $RepoOwner,
   [Parameter(Mandatory)][string] $RepoName,
-  [Parameter(Mandatory)][string] $RunUrl
+  [Parameter(Mandatory)][string] $RunUrl,
+  [string] $ExportDir = ""
 )
 
 Set-StrictMode -Version Latest
@@ -25,34 +26,41 @@ $Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm") + " UTC"
 $Repo      = "$RepoOwner/$RepoName"
 
 # ── Load reports ──────────────────────────────────────────────────────────────
-function Load-Json($path) {
+function Get-ReportJson($path) {
   if (Test-Path $path) { return Get-Content $path -Raw | ConvertFrom-Json }
   return $null
 }
 
-$ScanSummary  = Load-Json (Join-Path $ScanDir   "scan-summary.json")
-$MatchReport  = Load-Json (Join-Path $ReviewDir "deployment-match-report.json")
-$DriftReport  = Load-Json (Join-Path $DriftDir  "drift-report.json")
-$DrSummary    = Load-Json (Join-Path $DrDir     "dr-summary.json")
-$DrValidation = Load-Json (Join-Path $DrDir     "dr-validation-report.json")
+$ScanSummary        = Get-ReportJson (Join-Path $ScanDir   "scan-summary.json")
+$MatchReport        = Get-ReportJson (Join-Path $ReviewDir "deployment-match-report.json")
+$DriftReport        = Get-ReportJson (Join-Path $DriftDir  "drift-report.json")
+$DrSummary          = Get-ReportJson (Join-Path $DrDir     "dr-summary.json")
+$DrValidation       = Get-ReportJson (Join-Path $DrDir     "dr-validation-report.json")
+$DrHealthReport     = Get-ReportJson (Join-Path $DrDir     "dr-health-report.json")
+$UnsupportedSummary = if ($ExportDir) { Get-ReportJson (Join-Path $ExportDir "unsupported-summary.json") } else { $null }
 
 # ── Derive status indicators ──────────────────────────────────────────────────
-$DriftCritical = if ($DriftReport) { $DriftReport.summary.critical  } else { 0 }
-$DriftWarnings = if ($DriftReport) { $DriftReport.summary.warnings  } else { 0 }
-$TotalDrift    = if ($DriftReport) { $DriftReport.summary.totalDriftItems } else { 0 }
-$Matched       = if ($MatchReport) { $MatchReport.summary.matched   } else { 0 }
-$Unmatched     = if ($MatchReport) { $MatchReport.summary.unmatched } else { 0 }
-$Coverage      = if ($MatchReport) { $MatchReport.summary.deploymentCoverage } else { "N/A" }
-$DrGenerated   = if ($DrSummary)   { $DrSummary.processed  } else { 0 }
-$DrPass        = if ($DrValidation){ $DrValidation.validationSummary.passed } else { 0 }
-$DrFail        = if ($DrValidation){ $DrValidation.validationSummary.failed } else { 0 }
-$DrRegion      = if ($DrSummary)   { $DrSummary.drRegion    } else { "N/A" }
-$SubsScanned   = if ($ScanSummary) { $ScanSummary.subscriptionsScanned } else { "?" }
-$TotalRes      = if ($ScanSummary) { $ScanSummary.totalResourcesFound  } else { "?" }
+$DriftCritical          = if ($DriftReport)         { $DriftReport.summary.critical             } else { 0 }
+$DriftWarnings          = if ($DriftReport)         { $DriftReport.summary.warnings             } else { 0 }
+$TotalDrift             = if ($DriftReport)         { $DriftReport.summary.totalDriftItems      } else { 0 }
+$Matched                = if ($MatchReport)         { $MatchReport.summary.matched              } else { 0 }
+$Unmatched              = if ($MatchReport)         { $MatchReport.summary.unmatched            } else { 0 }
+$Coverage               = if ($MatchReport)         { $MatchReport.summary.deploymentCoverage  } else { "N/A" }
+$DrGenerated            = if ($DrSummary)           { $DrSummary.processed                     } else { 0 }
+$DrPass                 = if ($DrValidation)        { $DrValidation.validationSummary.passed    } else { 0 }
+$DrFail                 = if ($DrValidation)        { $DrValidation.validationSummary.failed    } else { 0 }
+$DrRegion               = if ($DrSummary)           { $DrSummary.drRegion                      } else { "N/A" }
+$SubsScanned            = if ($ScanSummary)         { $ScanSummary.subscriptionsScanned         } else { "?" }
+$TotalRes               = if ($ScanSummary)         { $ScanSummary.totalResourcesFound          } else { "?" }
+$RequiresHandAuthoredDR = if ($UnsupportedSummary)  { $UnsupportedSummary.requiresHandAuthoredDR } else { 0 }
+$DriftSeverity          = if ($DriftCritical -gt 0) { "critical" } elseif ($DriftWarnings -gt 0) { "warning" } else { "ok" }
+$DrHealthStatus         = if ($DrHealthReport)      { $DrHealthReport.summary.status            } else { "N/A" }
+$DrHealthChecks         = if ($DrHealthReport)      { $DrHealthReport.summary.totalChecks       } else { "N/A" }
+$DrHealthPassed         = if ($DrHealthReport)      { $DrHealthReport.summary.passed            } else { "N/A" }
 
-$OverallStatus = if ($DriftCritical -gt 0 -or $Unmatched -gt 0) { "🔴 Action Required" }
-                 elseif ($DriftWarnings -gt 0)                   { "🟡 Review Recommended" }
-                 else                                             { "🟢 Compliant" }
+$OverallStatus = if ($DriftCritical -gt 0 -or $Unmatched -gt 0)                { "🔴 Action Required" }
+                 elseif ($DriftWarnings -gt 0 -or $RequiresHandAuthoredDR -gt 0) { "🟡 Review Recommended" }
+                 else                                                              { "🟢 Compliant" }
 
 # ── Build markdown comment body ───────────────────────────────────────────────
 $CriticalRows = if ($DriftReport -and $DriftCritical -gt 0) {
@@ -95,6 +103,7 @@ $(if ($Unmatched -gt 0) { "> ⚠️ **$Unmatched IaC file(s)** define resources 
 |---|---|
 | 🟡 Warnings | $DriftWarnings |
 | Total | $TotalDrift |
+| Drift Severity | $DriftSeverity |
 
 $(if ($DriftCritical -gt 0) { @"
 **Top Critical Items:**
@@ -108,12 +117,17 @@ $($CriticalRows -join "`n")
 
 ---
 
-### 4️⃣ DR Configuration (→ ``$DrRegion``)
-| DR Templates Generated | $DrGenerated |
+### 4️⃣ DR Health (``$DrRegion``)
+| Metric | Value |
 |---|---|
+| Health Check Status | $DrHealthStatus |
+| Checks Passed | $DrHealthPassed / $DrHealthChecks |
+| DR Templates Generated | $DrGenerated |
 | Validation Passed | $DrPass |
 | Validation Failed | $DrFail |
+| Requires Hand-Authored DR | $RequiresHandAuthoredDR |
 
+$(if ($RequiresHandAuthoredDR -gt 0) { "> ⚠️ $RequiresHandAuthoredDR resource type(s) have no automated DR template. Hand-authored DR configuration is required." })
 $(if ($DrFail -gt 0) { "> ⚠️ $DrFail DR template(s) failed what-if validation. Review the ``dr-config`` artifact." })
 
 ---
@@ -123,6 +137,7 @@ $(if ($DriftCritical -gt 0 -or $Unmatched -gt 0) {
   "- 🚨 **Resolve $DriftCritical critical drift item(s) before merging**`n- Deploy all IaC changes to Azure"
 })
 $(if ($DriftWarnings -gt 0) { "- 👀 Review warning-level items in ``CONFIGURATION-DRIFT.md``" })
+$(if ($RequiresHandAuthoredDR -gt 0) { "- 📝 **$RequiresHandAuthoredDR resource type(s) require hand-authored DR templates** — see unsupported-summary.json" })
 $(if ($TotalDrift -eq 0 -and $Unmatched -eq 0) { "- ✅ All checks passed — safe to merge" })
 
 ---
@@ -167,10 +182,12 @@ try {
 }
 
 # ── Set GitHub Actions outputs for downstream use ─────────────────────────────
-"DRIFT_CRITICAL=$DriftCritical"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-"DRIFT_WARNINGS=$DriftWarnings"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-"DEPLOYMENT_COVERAGE=$Coverage"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-"DR_TEMPLATES_GENERATED=$DrGenerated" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+"DRIFT_CRITICAL=$DriftCritical"                    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+"DRIFT_WARNINGS=$DriftWarnings"                    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+"DEPLOYMENT_COVERAGE=$Coverage"                    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+"DR_TEMPLATES_GENERATED=$DrGenerated"              | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+"REQUIRES_HAND_AUTHORED_DR=$RequiresHandAuthoredDR" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+"DRIFT_SEVERITY=$DriftSeverity"                    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
 # ── Emit workflow annotations ─────────────────────────────────────────────────
 if ($DriftCritical -gt 0) {

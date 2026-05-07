@@ -1,3 +1,4 @@
+﻿#Requires -Version 7.2
 # =============================================================================
 # match-code-to-deployed.ps1
 # Stage 3b: Match PR code changes to deployed Azure resources.
@@ -8,7 +9,6 @@
 param(
     [Parameter(Mandatory)] [string] $PrChangesFile,
     [Parameter(Mandatory)] [string] $ScanDir,
-    [Parameter(Mandatory)] [string] $ExportDir,
     [Parameter(Mandatory)] [string] $OutputDir,
     [Parameter(Mandatory)] [string] $RunId
 )
@@ -31,46 +31,84 @@ if (-not (Test-Path $PrChangesFile))    { Write-Error "pr-changes.json not found
 $AllResources = Get-Content $AllResourcesFile -Raw | ConvertFrom-Json
 $Changes      = Get-Content $PrChangesFile    -Raw | ConvertFrom-Json
 
-# ── Extract resource names from Bicep ────────────────────────────────────────
-function Get-BicepResourceNames([string]$File) {
+# ── Extract resource name+type objects from Bicep (compile-then-match) ────────
+function Get-BicepResourceName([string]$File) {
     if (-not (Test-Path $File)) { return @() }
-    $content = Get-Content $File -Raw
-    $names   = [System.Collections.Generic.List[string]]::new()
-    # name: 'literal'  or  name: "literal"
-    foreach ($m in [regex]::Matches($content, "name:\s*['\`"]([^'\`"\[\$\n]+)['\`"]")) {
-        $names.Add($m.Groups[1].Value.Trim())
+
+    # Try compile path first — most accurate
+    $azCmd = Get-Command 'az' -ErrorAction SilentlyContinue
+    if ($azCmd) {
+        try {
+            $armJson = az bicep build --stdout --file $File 2>$null
+            if ($LASTEXITCODE -eq 0 -and $armJson) {
+                $tpl = $armJson | ConvertFrom-Json -ErrorAction Stop
+                $compiledEntries = @(
+                    $tpl.resources |
+                        Where-Object { $_.name -and $_.name -notmatch '^\[' } |
+                        Select-Object -Property name, type
+                )
+                # Regex fallback only for resources with ARM-expression names (runtime-only)
+                $regexEntries = @()
+                if ($tpl.resources | Where-Object { $_.name -match '^\[' }) {
+                    $src = Get-Content $File -Raw
+                    foreach ($m in [regex]::Matches($src, 'name:\s*[\x27\x22]([^\x27\x22\[$\n]+)[\x27\x22]')) {
+                        $regexEntries += [PSCustomObject]@{ name = $m.Groups[1].Value.Trim(); type = '' }
+                    }
+                }
+                return @($compiledEntries + $regexEntries)
+            }
+        } catch { Write-Verbose "bicep build failed for ${File}: $_" }
     }
-    return $names
+
+    # Regex fallback (no bicep CLI or compile failed)
+    $src     = Get-Content $File -Raw
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($m in [regex]::Matches($src, 'name:\s*[\x27\x22]([^\x27\x22\[$\n]+)[\x27\x22]')) {
+        $entries.Add([PSCustomObject]@{ name = $m.Groups[1].Value.Trim(); type = '' })
+    }
+    return $entries.ToArray()
 }
 
-# ── Extract resource names from ARM JSON ──────────────────────────────────────
-function Get-ArmResourceNames([string]$File) {
+# ── Extract resource name+type objects from ARM JSON ──────────────────────────
+function Get-ArmResourceName([string]$File) {
     if (-not (Test-Path $File)) { return @() }
     try {
         $tpl = Get-Content $File -Raw | ConvertFrom-Json
-        return $tpl.resources | Where-Object { $_.name -and $_.name -notmatch '^\[' } |
-               Select-Object -ExpandProperty name
+        return @(
+            $tpl.resources |
+                Where-Object { $_.name -and $_.name -notmatch '^\[' } |
+                Select-Object -Property name, type
+        )
     } catch { return @() }
 }
 
-# ── Extract resource names from PowerShell ───────────────────────────────────
-function Get-PsResourceNames([string]$File) {
+# ── Extract resource name objects from PowerShell (type unknown) ──────────────
+function Get-PsResourceName([string]$File) {
     if (-not (Test-Path $File)) { return @() }
-    $content = Get-Content $File -Raw
-    $names   = [System.Collections.Generic.List[string]]::new()
-    # -Name "value"  or  -ResourceGroupName "value"  etc.
-    foreach ($m in [regex]::Matches($content, '-Name\s+"([^"]+)"')) {
-        $names.Add($m.Groups[1].Value.Trim())
+    $src     = Get-Content $File -Raw
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($m in [regex]::Matches($src, '-Name\s+"([^"]+)"')) {
+        $entries.Add([PSCustomObject]@{ name = $m.Groups[1].Value.Trim(); type = '' })
     }
-    foreach ($m in [regex]::Matches($content, "-Name\s+'([^']+)'")) {
-        $names.Add($m.Groups[1].Value.Trim())
+    foreach ($m in [regex]::Matches($src, "-Name\s+'([^']+)'")) {
+        $entries.Add([PSCustomObject]@{ name = $m.Groups[1].Value.Trim(); type = '' })
     }
-    return $names
+    return $entries.ToArray()
 }
 
-# ── Check if a resource name exists in the scan ───────────────────────────────
-function Find-InScan([string]$Name) {
-    return @($AllResources | Where-Object { $_.name -and $_.name.ToLower() -eq $Name.ToLower() })
+# ── Find a resource in the scan by (name, type) tuple ────────────────────────
+# When `$Type` is non-empty, requires exact type match (no name-only fallback).
+# When `$Type` is empty, uses name-only matching (type unavailable from code).
+function Find-InScan([string]$Name, [string]$Type = '') {
+    if ($Type) {
+        # Strict tuple match — type must also agree
+        return ,@($AllResources | Where-Object {
+            $_.name -and $_.name.ToLower() -eq $Name.ToLower() -and
+            $_.type -and $_.type.ToLower() -eq $Type.ToLower()
+        })
+    }
+    # Name-only match when no type info is available from code extraction
+    return ,@($AllResources | Where-Object { $_.name -and $_.name.ToLower() -eq $Name.ToLower() })
 }
 
 # ── Process each change ───────────────────────────────────────────────────────
@@ -84,17 +122,17 @@ foreach ($Change in $Changes) {
     $Category = $Change.category
     $RgHint   = $Change.resourceGroupHint
 
-    $ResourceNames = switch ($Category) {
-        "bicep"        { Get-BicepResourceNames $Path }
-        "arm-template" { Get-ArmResourceNames   $Path }
-        "powershell"   { Get-PsResourceNames     $Path }
-        default        { @() }
-    }
+    $ResourceEntries = @(switch ($Category) {
+        'bicep'        { Get-BicepResourceName $Path }
+        'arm-template' { Get-ArmResourceName   $Path }
+        'powershell'   { Get-PsResourceName    $Path }
+        default        { }
+    })
 
-    if ($Category -eq "other" -or ($Category -notin @("bicep","arm-template","powershell","config-json"))) {
+    if ($Category -eq 'other' -or ($Category -notin @('bicep','arm-template','powershell','config-json'))) {
         $NotIaC++
         $Results.Add([ordered]@{
-            path = $Path; category = $Category; status = "not-iac"
+            path = $Path; category = $Category; status = 'not-iac'
             deploymentVerified = $null; resources = @()
         })
         continue
@@ -104,23 +142,35 @@ foreach ($Change in $Changes) {
     $AllFound    = $true
     $AnyFound    = $false
 
-    foreach ($Name in $ResourceNames) {
-        $Name = $Name.Trim()
-        if (-not $Name) { continue }
-        $Matches = Find-InScan $Name
-        if ($Matches.Count -gt 0) {
+    foreach ($ResEntry in $ResourceEntries) {
+        $ResName = if ($ResEntry -is [string]) { $ResEntry } else { $ResEntry.name }
+        $ResType = if ($ResEntry -is [string]) { '' }         else { "$($ResEntry.type)" }
+        $ResName = $ResName.Trim()
+        if (-not $ResName) { continue }
+
+        $FoundResources = Find-InScan $ResName $ResType
+        if ($FoundResources.Count -gt 0) {
             $AnyFound = $true
-            $FileResults.Add([ordered]@{ name = $Name; foundInAzure = $true;  details = $Matches[0] })
+            $FileResults.Add([ordered]@{ name = $ResName; type = $ResType; foundInAzure = $true;  details = $FoundResources[0] })
         } else {
             $AllFound = $false
-            $FileResults.Add([ordered]@{ name = $Name; foundInAzure = $false; details = $null })
+            $FileResults.Add([ordered]@{ name = $ResName; type = $ResType; foundInAzure = $false; details = $null })
         }
     }
 
-    $Status = if ($FileResults.Count -eq 0) { "no-resources-extracted"; $Unmatched++ }
-              elseif ($AllFound)             { "all-deployed";            $Matched++   }
-              elseif ($AnyFound)             { "partially-deployed";      $Unmatched++ }
-              else                           { "not-deployed";             $Unmatched++ }
+    if ($FileResults.Count -eq 0) {
+        $Unmatched++
+        $Status = 'no-resources-extracted'
+    } elseif ($AllFound) {
+        $Matched++
+        $Status = 'all-deployed'
+    } elseif ($AnyFound) {
+        $Unmatched++
+        $Status = 'partially-deployed'
+    } else {
+        $Unmatched++
+        $Status = 'not-deployed'
+    }
 
     $Results.Add([ordered]@{
         path               = $Path
@@ -133,8 +183,8 @@ foreach ($Change in $Changes) {
 }
 
 $Coverage = if (($Matched + $Unmatched) -gt 0) {
-    [math]::Floor($Matched / ($Matched + $Unmatched) * 100).ToString() + "%"
-} else { "N/A" }
+    [math]::Floor($Matched / ($Matched + $Unmatched) * 100).ToString() + '%'
+} else { 'N/A' }
 
 [ordered]@{
     runId     = $RunId
@@ -146,6 +196,6 @@ $Coverage = if (($Matched + $Unmatched) -gt 0) {
         deploymentCoverage = $Coverage
     }
     results = $Results
-} | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $OutputDir "deployment-match-report.json") -Encoding UTF8
+} | ConvertTo-Json -Depth 10 | Set-Content -Path (Join-Path $OutputDir 'deployment-match-report.json') -Encoding UTF8
 
 Write-Host "REVIEW COMPLETE  Matched: $Matched  Unmatched: $Unmatched  Non-IaC: $NotIaC"
