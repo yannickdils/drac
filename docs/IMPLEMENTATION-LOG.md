@@ -646,4 +646,22 @@ pwsh tests/bicep-build-all.ps1
 
 ---
 
+## Round 5 follow-up #4 — Documentation freshness
+
+**Landed 2026-05-07.** Closes the project-rule gap that PRs #1 and #2 left open: per `IMPLEMENTATION-BRIEF.md`'s "Documentation update protocol", every commit that changes behaviour must update `docs/ARCHITECTURE.md` and `docs/DOCUMENTATION.md` in the same commit. Both prior commits updated `IMPLEMENTATION-LOG.md` only. Same-commit-as-behaviour was missed; this commit reconciles.
+
+**Changes:**
+
+| File | What changed |
+|---|---|
+| `docs/ARCHITECTURE.md` | Stage 7 row "Test-DRHealth invocation" flipped from "deferred" to **wired post-deploy** with the actual call signature. R4.1 module-dispatch contract now describes the consumer in `generate-dr-config.ps1` (emits `<rg>-dispatched-modules.bicep`, with `../../modules/<file>` paths and `'TODO: <name>'` placeholders). Two new sections appended: **Round 5 follow-up #2 — Wire-ups (R4.1 / R4.2 / R5.6 / R5.7 / R5.8)** describing the `pr-compliance.yml` steps and PR-comment renderer additions; **Round 5 follow-up #3 — Polish (#6 setup-github.ps1, #7 README)** documenting the merge-queue auto-config and analyzer cleanup. |
+| `docs/DOCUMENTATION.md` | Stage 7 "Test-DRHealth invocation point" placeholder replaced with the actual wiring description. R5.6 Stage 9 operator guidance flipped from "wire it into pr-compliance.yml" to "is wired in pr-compliance.yml". Pre-deploy DR validators (R5.7 + R5.8) section now shows the actual workflow steps (with `continue-on-error: true` and the `azure/cli@v2` action) instead of a manual-invocation template. New **PR comment layout** subsection enumerates all six sections (1️⃣–6️⃣) with their data sources and the `OverallStatus` heuristic. R5.9 concurrent-PR-safety section now describes Step 6 + Step 6b in `setup-github.ps1` instead of telling operators to configure merge queue manually. New **R4.1 DR module dispatch — operator workflow** subsection walks through the dispatched-modules.bicep operator flow (locate → copy to `bicep/regions/dr/` → fill TODOs → submit). |
+| `README.md` | GitHub Actions Repository Secrets table now lists `DRAAC_BASELINE_STORAGE_ACCOUNT` (was missing — PR #1 added the secret to the workflow but didn't surface it in the operator-facing secrets table). |
+
+**Validation:** `Invoke-Validation.ps1` 20/20 pass; `Invoke-ScriptAnalyzer` 0 issues; `bicep-build-all.ps1` 12/12 succeeded. No code changes — docs only.
+
+**What remains genuinely outside repo scope:** the operator-action items in the brief's Final acceptance checklist that need a sandbox subscription (real PR exercises Stages 1–7, real portal change → portal-sync PR within 24h, Front Door failover test). These are explicitly deferred and tracked in `docs/NEXT-SESSION-BRIEF.md`. The "20 Notion backlog items resolved or deferred" line is bookkeeping outside the repo.
+
+---
+
 _Log started 2026-05-04. Append, never rewrite history. Every commit that lands a brief item should add an entry here in the same commit._

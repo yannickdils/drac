@@ -212,7 +212,7 @@ Triggers on push to `main` when `bicep/regions/dr/**` changes; can also be re-ru
 | Throttling retry | Detects `429`/`Throttling*`/`TooManyRequests`; exponential backoff `[5, 15, 45, 135]` seconds before failing |
 | Per-RG fault tolerance | Each file's failure is captured in `_reports/deploy/failures.json`; the loop continues to the next file |
 | Final summary | `_reports/deploy/deploy-summary.json` with `processed`, `succeeded`, `failed`, `deploymentNames`, `runId`, `commitSha` |
-| `Test-DRHealth.ps1` invocation | Marked as a comment placeholder; deferred to Round 4 §R4.2 |
+| `Test-DRHealth.ps1` invocation | **Wired post-deploy** (R4.2). After the deploy loop, `deploy-dr-region.ps1` invokes `Test-DRHealth.ps1 -DeploySummaryFile <summary> -OutputDir <dir> -DrRegion <region>`. Skipped under `-DryRun` and on zero successful deploys; probe failures are logged as warnings, never gate the workflow. |
 
 **Files added in Round 2:**
 
@@ -268,7 +268,11 @@ Round 4 closes the gap between "DR companion files exist" and "DR is actually a 
 
 #### R4.1 module-dispatch contract
 
-`Convert-ForDR` returns a `Dispatched` array of records: `{ type, originalName, drName, module, resource }`. Dispatch runs *before* the name-rewrite transform so `originalName` is the input-template name and `drName` reflects the rewrite map (including the parent-segment rewrite for nested types like `Microsoft.Sql/servers/databases`). `Convert-ForDR` does NOT mutate the template based on dispatch — the caller (today: `check-dr-coverage.ps1`'s auto-gen path; future: a post-decompile rewriter) decides whether to swap naive resource declarations for `module` references. Default registry (loaded from `data/dr-module-registry.json`):
+`Convert-ForDR` returns a `Dispatched` array of records: `{ type, originalName, drName, module, resource }`. Dispatch runs *before* the name-rewrite transform so `originalName` is the input-template name and `drName` reflects the rewrite map (including the parent-segment rewrite for nested types like `Microsoft.Sql/servers/databases`). `Convert-ForDR` does NOT mutate the template based on dispatch — the caller decides whether to swap naive resource declarations for `module` references.
+
+**Consumer (Round 5 follow-up):** `scripts/dr/generate-dr-config.ps1` calls `Initialize-DefaultDrModuleRegistry` so dispatch records are populated against the live registry, then for any RG with at least one dispatched record emits `<rg>-dispatched-modules.bicep` containing one `module` block per dispatched family. Required params are emitted as `'TODO: <name>'` placeholders with the module's `@description` text inline as a comment. Path is `../../modules/<file>` — resolves cleanly when the file is placed at `bicep/regions/dr/`. The naive copy continues to live in `template.json` for ARM-template round-trip parity; the operator deploys the dispatched-modules file once they fill in the TODOs. `dr-metadata.json` carries a `dispatched` array and `dr-summary.json` carries `totalDispatched`.
+
+Default registry (loaded from `data/dr-module-registry.json`):
 
 | Type | Module | Replication |
 |---|---|---|
@@ -473,3 +477,56 @@ Three new optional report files are now consumed by the summary writer; missing 
 ### Bicep encoding fix
 
 `bicep/modules/dr-mysql.bicep` and `bicep/modules/dr-postgres.bicep` previously contained the U+2265 "≥" character in `@description` comments. `az bicep build` on Windows hosts (Python `cp1252` encoding) fails to encode this character. Replaced both with `>=` / `at least as large as`. Linux CI runners were unaffected; this fix unblocks `tests/bicep-build-all.ps1` on Windows.
+
+---
+
+## Round 5 follow-up #2 — Wire-ups (R4.1 / R4.2 / R5.6 / R5.7 / R5.8)
+
+The first R5 follow-up commit shipped the SCRIPTS for R5.6–R5.9 but didn't connect them to the live workflow / deploy / PR-comment renderer. The second follow-up (PR #1, commit `15b6e0c`) closes those connections.
+
+### R4.1 dispatch consumer wired
+
+`generate-dr-config.ps1` now calls `Initialize-DefaultDrModuleRegistry` and emits `<rg>-dispatched-modules.bicep` per RG (see "R4.1 module-dispatch contract" above). `dr-metadata.json` gains a `dispatched` array; `dr-summary.json` gains `totalDispatched`. The smoke test `tests/round-1/Test-GenerateDrConfig-Smoke.ps1` asserts the emission for `simple-rg` (which has a Storage Account = registered family) and the absence of the file for `peered-vnet-rg` (no registered families).
+
+### R4.2 health probe wired
+
+`scripts/dr/deploy-dr-region.ps1` invokes `Test-DRHealth.ps1` post-deploy against `deploy-summary.json`. Skipped under `-DryRun` and on zero successful deploys. Probe failures are logged as warnings, never fatal. Removed the "deferred to Round 4.2" comment block at the head of the file and the placeholder inside the loop.
+
+### R5.6 / R5.7 / R5.8 wired into `pr-compliance.yml`
+
+Three new steps:
+
+| Step | Job | Behaviour |
+|---|---|---|
+| `Slow drift — compare against baseline` | `scan` | Runs `Compare-AgainstBaseline.ps1` immediately after the subscription scan. Output `_reports/scan/slow-drift.json` ships with the `scan-results` artifact. `continue-on-error: true`. The script no-ops gracefully when `DRAAC_BASELINE_STORAGE_ACCOUNT` is unset or no baseline exists yet (first-time installs). |
+| `SKU availability check (DR region)` | `disaster-recovery` | Runs `Test-SkuAvailability.ps1` after `generate-dr-config.ps1`. Output `_reports/dr/sku-availability.json` ships with the `dr-config` artifact. `continue-on-error: true`. |
+| `API-version compatibility check (DR region)` | `disaster-recovery` | Runs `Test-ApiVersionCompatibility.ps1` after `generate-dr-config.ps1`. Output `_reports/dr/api-version-compat.json` ships with the `dr-config` artifact. `continue-on-error: true`. |
+
+### PR comment renders the new sections
+
+`scripts/report/post-pr-comment-github.ps1` loads `slow-drift.json` / `sku-availability.json` / `api-version-compat.json` and renders two new sections:
+
+- **5️⃣ Pre-deploy DR validators** — counts table for SKU and API-version checks, plus max-5 detail tables for unavailable SKUs (with suggested substitutes) and incompatible API versions (with suggested versions).
+- **6️⃣ Slow drift (since baseline)** — appeared / disappeared / changed counts plus a max-5 detail table.
+
+The `OverallStatus` heuristic downgrades to "🟡 Review Recommended" on any pre-deploy warning or any slow-drift item. The "Required Actions" footer lists each new failure mode with explicit operator hints.
+
+### Bug caught during validation
+
+`post-pr-comment-github.ps1` lines 257 / 262 used bash-style `\` line continuations on `gh api` calls. PowerShell rejects this; PSScriptAnalyzer's parser is tolerant so the bug was latent since Round 1. Fixed in the same commit.
+
+---
+
+## Round 5 follow-up #3 — Polish (#6 setup-github.ps1, #7 README)
+
+Lower-priority gaps deferred from the wire-up commit. Landed in PR #2 / commit `5965626`.
+
+### `setup-github.ps1` enhancements
+
+- **Branch-protection contexts list** stays at the original 6 jobs from `pr-compliance.yml`. New comments document that Stage 3.5 (DR coverage gate) is covered by Job 3's required check (it runs as a step inside that job — failing the step fails Job 3) and that Stages 7 / 8 / 9 are deliberately omitted because they trigger on push / cron / dispatch and cannot gate a PR.
+- **Step 6b — merge queue** (Round 5 §R5.9 chosen strategy). `PUT /repos/{owner}/{repo}/branches/main/queue_config` configures squash + all-green grouping (max 5 entries, 5-min wait, 60-min check timeout). REST endpoint may not be GA on every plan; the script degrades gracefully with manual-setup instructions when the call fails.
+- **Static-analysis cleanup.** This file was never previously analyzed — the project pass scopes to `scripts/` only. Five IDE-surfaced warnings resolved: removed unused `$RepoOwner`; added `[SuppressMessageAttribute]` blocks to `Set-RoleIfMissing` / `Set-FederatedCredential` / `Set-GitHubSecret` (state-changing helpers, `-WhatIf` is not part of the bootstrap UX); suppressed a `PSAvoidUsingPlainTextForPassword` false positive on `Set-FederatedCredential.$CredName`.
+
+### README Quick Start
+
+`bash export ...` replaced with `$env:... = "..."` to align with project rule #1 (PowerShell 7.2+ only).
