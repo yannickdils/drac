@@ -90,6 +90,8 @@ $env:DR_SUBNET_ADDRESS_PREFIX = "10.1.0.0/24"
 ```
 Creates the App Registration, configures OIDC federated credentials, assigns Azure roles, and sets all repository secrets automatically.
 
+> **Adopting DRaaC into a repository that already has CI, IaC, or branch protection?** See [docs/INTEGRATION.md](docs/INTEGRATION.md) for the seven-phase coexistence guide (collision audit, primary-Bicep migration, baseline seeding, rollback).
+
 ---
 
 ## Repository Structure
