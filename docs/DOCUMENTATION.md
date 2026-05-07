@@ -290,7 +290,7 @@ bicep/regions/
 
 **Manual re-run:** Trigger via the Actions tab → "DRaaC DR Deploy" → "Run workflow". Useful for re-deploying without a code change (e.g. after manually deleting an RG).
 
-**Test-DRHealth invocation point:** A comment placeholder in `deploy-dr-region.ps1` marks where the post-deploy health check will hook in once Round 4 §R4.2 is implemented.
+**Test-DRHealth invocation:** After the deploy loop completes, `deploy-dr-region.ps1` automatically invokes `scripts/dr/Test-DRHealth.ps1 -DeploySummaryFile <summary>.json -OutputDir <dir> -DrRegion <region>` so `dr-health-report.json` lands alongside `deploy-summary.json` in the same `_reports/deploy/` tree. Skipped under `-DryRun` and when no deploys succeeded. Probe failures are logged as warnings — they never fail the deploy workflow (the deploy is the source of truth; health is supplementary). To make the probe a hard gate, re-run with `Test-DRHealth.ps1 -FailOnUnhealthy`.
 
 ---
 
@@ -584,45 +584,76 @@ Run by `.github/workflows/baseline-snapshot.yml` on every push to `main`, plus a
 2. Add a repository secret `DRAAC_BASELINE_STORAGE_ACCOUNT` with the Storage Account name.
 3. Apply a lifecycle-management policy to move blobs cool after 90 days and delete after 365 — see the YAML comment block at the top of `baseline-snapshot.yml` for the JSON.
 
-**During PR runs:** wire `Compare-AgainstBaseline.ps1` into `pr-compliance.yml` after the scan step (or run it on a separate scheduled cadence; the slow-drift signal does not need to be live per-PR). Output `_reports/scan/slow-drift.json` is consumed by `write-job-summary.ps1` and surfaces under the **Slow Drift (since baseline)** section in the GitHub Actions summary.
+**During PR runs:** `pr-compliance.yml`'s `scan` job runs `Compare-AgainstBaseline.ps1` immediately after the subscription scan (`continue-on-error: true`). Output `_reports/scan/slow-drift.json` ships in the `scan-results` artifact and is rendered both in the GitHub Actions step summary (via `write-job-summary.ps1`) and in the **6️⃣ Slow drift (since baseline)** section of the PR comment (via `post-pr-comment-github.ps1`).
 
 **First-run behaviour:** if `latest.txt` is missing in the container, the comparator emits a slow-drift report with `summary.total = 0` and `baseline.available = false`. The next push-to-`main` snapshot becomes the seed.
 
 ### Pre-deploy DR validators (R5.7 + R5.8)
 
-Run after Stage 5a (`generate-dr-config.ps1`), before Stage 7 deploy. Both scripts share the same calling convention:
+Run automatically by `pr-compliance.yml`'s `disaster-recovery` job after `generate-dr-config.ps1`, both with `continue-on-error: true` so warnings surface in the PR comment without failing the workflow:
 
-```powershell
-pwsh scripts/dr/Test-SkuAvailability.ps1 `
-  -DrConfigDir _reports/dr/arm `
-  -DrRegion $DR_TARGET_REGION `
-  -OutputFile _reports/dr/sku-availability.json
+```yaml
+- name: SKU availability check (DR region)
+  uses: azure/cli@v2
+  continue-on-error: true
+  with:
+    run: |
+      pwsh scripts/dr/Test-SkuAvailability.ps1 `
+        -DrConfigDir _reports/dr/arm `
+        -DrRegion $DR_TARGET_REGION `
+        -OutputFile _reports/dr/sku-availability.json
 
-pwsh scripts/dr/Test-ApiVersionCompatibility.ps1 `
-  -DrConfigDir _reports/dr/arm `
-  -DrRegion $DR_TARGET_REGION `
-  -OutputFile _reports/dr/api-version-compat.json
+- name: API-version compatibility check (DR region)
+  uses: azure/cli@v2
+  continue-on-error: true
+  with:
+    run: |
+      pwsh scripts/dr/Test-ApiVersionCompatibility.ps1 `
+        -DrConfigDir _reports/dr/arm `
+        -DrRegion $DR_TARGET_REGION `
+        -OutputFile _reports/dr/api-version-compat.json
 ```
 
 Both scripts default to **exit 0** even when issues are found — gating is via the GitHub Actions output (`SKU_AVAILABILITY_OK`, `API_VERSION_COMPAT_OK`). Add `-FailOnUnavailable` / `-FailOnIncompatible` only when you want a hard CI gate.
 
-The `write-job-summary.ps1` reporter renders the top 10 unavailable SKUs and the top 10 incompatible API versions into the GitHub Actions step summary, with suggested substitutes where the heuristic produces one.
+Output is rendered both in the GitHub Actions step summary and in the **5️⃣ Pre-deploy DR validators** section of the PR comment (top-5 detail tables for unavailable SKUs and incompatible API versions, with suggested substitutes where the heuristic produces one).
+
+### PR comment layout (post-`pr-compliance.yml` run)
+
+The bot comment now has six sections, with the new R5 sections in positions 5 and 6:
+
+| # | Section | Source |
+|---|---|---|
+| 1️⃣ | Subscription Scan | `scan-summary.json` |
+| 2️⃣ | Deployment Coverage (Code → Azure) | `deployment-match-report.json` |
+| 3️⃣ | Configuration Drift | `drift-report.json` |
+| 4️⃣ | DR Health (DR region) | `dr-health-report.json` + `dr-summary.json` + `dr-validation-report.json` + `unsupported-summary.json` |
+| 5️⃣ | **Pre-deploy DR validators** (R5.7 + R5.8) | `sku-availability.json` + `api-version-compat.json` |
+| 6️⃣ | **Slow drift (since baseline)** (R5.6) | `slow-drift.json` |
+
+`OverallStatus` is `🔴 Action Required` when `DriftCritical > 0` or `Unmatched > 0`, `🟡 Review Recommended` when there are warnings / `RequiresHandAuthoredDR` / pre-deploy warnings / slow-drift items, otherwise `🟢 Compliant`.
 
 ### Concurrent PR safety (R5.9)
 
 **Choice: GitHub merge queue.** PRs that touch DR-relevant files (any path under `bicep/regions/primary/**`, `bicep/regions/dr/**`, or `bicep/modules/**`) MUST go through merge queue. This prevents two concurrent PRs from racing `Convert-ForDR` against the same RG.
 
-To enable:
+`setup-github.ps1` configures branch protection AND merge queue automatically:
 
-1. **Branch protection rule on `main`:**
-   - Require pull request reviews
-   - Require status checks: `pr-compliance` (the PR pipeline), `dr-coverage` (Stage 3.5)
-   - **Require merge queue**
-2. **Merge queue settings:**
-   - Merge method: Squash and merge
-   - Maximum PRs to build: 1 (serial; safest for Azure deployments)
-   - Wait time: 1–5 min, depending on team velocity
+1. **Step 6** — branch protection on `main` with the six `pr-compliance.yml` job names as required status checks. Stage 3.5 (DR coverage gate) is covered by Job 3's required check because it runs as a step inside it. Stages 7 / 8 / 9 are deliberately omitted (they trigger on push / cron / dispatch and cannot gate a PR).
+2. **Step 6b** — `PUT /repos/{owner}/{repo}/branches/main/queue_config` enables merge queue with squash merge method, all-green grouping, max 5 entries, 5-min wait, 60-min check timeout. The REST endpoint may not be GA on every GitHub plan; the script degrades gracefully with manual-setup instructions when the call fails. Manual fallback: Settings → Rules → Branches → main → Edit rule → check "Require merge queue".
 
 The `dr-deploy.yml` workflow already uses a `concurrency: { group: draac-dr-deploy, cancel-in-progress: false }` block so even without merge queue, two simultaneous merges to `main` will serialise at the deploy stage. Merge queue tightens the protection one stage earlier — at PR-merge time — preventing two PRs from both getting through their gates with stale views of the repo.
 
 **Fallback for orgs without merge queue:** wire a Storage-Account blob lease into `Convert-ForDR` and `commit-drift-readme.ps1` per the brief's option 1. Lease duration 60s, acquired before write, released after, retry-on-conflict up to 3 times. This is documented as a known fallback but not implemented in the current code; track it as a future enhancement when needed.
+
+### R4.1 DR module dispatch — operator workflow
+
+Stage 5a now produces a `<rg>-dispatched-modules.bicep` file in `_reports/dr/arm/<sub>/<rg>/` for every RG that contains a registered-family resource (SQL DB, Cosmos, Storage Account, Key Vault, Postgres replica, MySQL replica, Redis Premium). The file contains one `module` block per dispatched resource referencing the canonical companion under `bicep/modules/`.
+
+To use the dispatched modules:
+
+1. Locate the file in the artefact (`dr-config/arm/<sub>/<rg>/<rg>-dispatched-modules.bicep`).
+2. Copy / move it to `bicep/regions/dr/<rg>-dispatched-modules.bicep` so the `../../modules/<file>` paths resolve correctly.
+3. Fill in the `'TODO: <name>'` placeholders. Each placeholder has the module's `@description` text inline as a comment so you know what it expects.
+4. Decide whether to delete the equivalent naive copy from the decompiled `<rg>.bicep` file (or remove the resource from the input template entirely). The brief's intent is module-first; the naive copy exists for ARM-template round-trip parity only.
+5. Submit through the normal PR / Stage 7 deploy path. The `dispatch` records flow through `dr-metadata.json` so the PR comment can show how many resources are module-backed (via the `totalDispatched` field in `dr-summary.json`).

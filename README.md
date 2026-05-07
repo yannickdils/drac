@@ -243,6 +243,7 @@ See [docs/DOCUMENTATION.md](docs/DOCUMENTATION.md) for full configuration refere
 | `DR_TARGET_REGION` | DR target region (e.g. `northeurope`) |
 | `DR_VNET_ADDRESS_PREFIX` | DR VNet CIDR (e.g. `10.1.0.0/16`) |
 | `DR_SUBNET_ADDRESS_PREFIX` | DR subnet CIDR (e.g. `10.1.0.0/24`) |
+| `DRAAC_BASELINE_STORAGE_ACCOUNT` | Storage Account for the Stage 9 baseline-snapshot blob container (`draac-baseline`). Required by `baseline-snapshot.yml`; consumed by `Compare-AgainstBaseline.ps1` during PR runs. Optional — slow-drift detection no-ops when unset. |
 
 ### Platform Comparison
 
