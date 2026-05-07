@@ -8,6 +8,8 @@
 
 ## Table of Contents
 
+> **Integrating into an existing repository?** See [INTEGRATION.md](INTEGRATION.md) — the Quick Start below is greenfield-flavoured; the integration guide covers collision audits, primary-Bicep migration, baseline seeding, and rollback.
+
 1. [Quick Start](#quick-start)
 2. [Prerequisites](#prerequisites)
 3. [Setup Guide](#setup-guide)

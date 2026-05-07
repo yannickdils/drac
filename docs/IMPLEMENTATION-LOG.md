@@ -664,4 +664,22 @@ pwsh tests/bicep-build-all.ps1
 
 ---
 
+## Round 5 follow-up #5 — Integration guide for existing repositories
+
+**Landed 2026-05-07.** Closes the gap that the Quick Start covers greenfield repos only. Operators adopting DRaaC into a repo that already has CI, IaC, branch protection, or production traffic had no step-by-step path; the missing pieces were called out in conversation as: coexistence checklist, migration path for existing primary Bicep, first-run sequencing, baseline seeding, tenant constraints, and safe-uninstall.
+
+**Changes:**
+
+| File | What changed |
+|---|---|
+| `docs/INTEGRATION.md` | **New.** Seven-phase guide: (1) pre-flight audit (file collisions, branch-protection capture, federated-creds inventory, DR-region quota, existing-CI race-condition check); (2) additive drop-in with per-collision strategies; (3) `setup-github.ps1` walkthrough with verification steps; (4) primary-Bicep migration into the `bicep/regions/primary/<workload>.bicep` convention with public-facing-workload caveat; (5) first-PR expectations including auto-generated DR companions to review; (6) baseline-snapshot seeding; (7) per-stage smoke-test recipes. Also documents tenant/subscription constraints (cross-RG role assignment, primary-RG deploy targets for SQL/Redis, Front Door Premium availability, `AZURE_SUBSCRIPTION_IDS=ALL` mode), additive rollback procedure, and a symptoms-to-source troubleshooting table. **Plus an "Agent-driven setup" section** with paste-ready prompts (one per phase) for AI coding agents (Claude Code, Copilot CLI, Cursor, Codex). MCP-server inventory cites first-party servers verified May 2026 — `github/github-mcp-server`, `microsoft/mcp` (Azure, formerly `Azure/azure-mcp` — archived Aug 2025), `microsoft/azure-devops-mcp` (also has remote endpoint in public preview), Microsoft Learn MCP, Bicep MCP. Hard rules block the agent from auto-merging, widening role assignments, or running `Test-DRHealth.ps1 -FailOnUnhealthy` during integration. |
+| `README.md` | Added a callout under Quick Start pointing to `INTEGRATION.md` for repos that already have CI/IaC/branch protection. |
+| `docs/DOCUMENTATION.md` | Added a TOC callout pointing to `INTEGRATION.md`. The Quick Start in this file is one-line `cp -r ...` greenfield style — the new note tells adoption-flow readers where to go. |
+
+No code changes — docs only. No new behaviour, no new tests required.
+
+**Validation:** Doc-only change. Existing test suite unaffected. New file references existing line numbers in `setup-github.ps1`, `docs/DOCUMENTATION.md`, `bicep/regions/README.md`, and `scripts/dr/deploy-dr-region.ps1`; verified those anchors before commit.
+
+---
+
 _Log started 2026-05-04. Append, never rewrite history. Every commit that lands a brief item should add an entry here in the same commit._
