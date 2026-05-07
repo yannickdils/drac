@@ -408,3 +408,68 @@ Edit `data/readonly-properties.json` — add to `global` (every type) or `perTyp
 
 ### Support Terraform state comparison
 Add a new script `scripts/review/match-terraform-state.ps1` that uses `terraform show -json` output and calls the same scan data for lookup.
+
+---
+
+## Round 5 follow-up — Polish (R5.6 – R5.9)
+
+The first Round 5 commit landed R5.1 through R5.5. The follow-up commit completes Round 5 by adding baseline persistence, two pre-deploy DR validators, and resolving the concurrent-PR-race choice.
+
+### R5.6 / E1 — Baseline persistence (Stage 9)
+
+Two artefacts:
+
+| File | Role |
+|---|---|
+| `.github/workflows/baseline-snapshot.yml` | Stage 9 workflow. Triggers on push to `main` + daily 03:00 UTC backstop + `workflow_dispatch`. Runs `scan-subscriptions.ps1`, uploads `_reports/scan/` under a UTC-timestamp prefix in the `draac-baseline` blob container, then writes `latest.txt` last so the comparator never reads a partial snapshot. |
+| `scripts/scan/Compare-AgainstBaseline.ps1` | Pulls `latest.txt`, downloads the prefixed snapshot, diffs against the current scan in `_reports/scan/all-resources.json`. Outputs `_reports/scan/slow-drift.json` with `appeared` / `disappeared` / `changed` buckets. Read-only properties (`provisioningState`, `etag`, `creationTime`, `lastModifiedTime`, `createdDate`) are stripped before fingerprint comparison so portal-touch noise doesn't pollute the signal. |
+
+Lifecycle policy on the storage account container is documented at the top of `baseline-snapshot.yml` (90 days hot → cool, 365 days delete) and applied via `az storage account management-policy create` — not managed by the workflow itself.
+
+`-DryRun -FixtureBaselineDir <path>` is the test seam — used by `tests/round-5/Test-CompareAgainstBaseline.ps1`.
+
+### R5.7 / E2 — SKU availability check (Stage 7-DR)
+
+`scripts/dr/Test-SkuAvailability.ps1` walks every `template.json` produced by Stage 5a, extracts `(type, sku)` pairs, and verifies each SKU is available in the DR region using:
+- `az vm list-skus --location $DrRegion` for `Microsoft.Compute/virtualMachines` and `virtualMachineScaleSets`.
+- `az appservice list-locations --sku <name>` for `Microsoft.Web/serverfarms`.
+- `az sql db list-editions --location $DrRegion --available` for `Microsoft.Sql/servers/databases` and `servers`.
+
+Per-namespace `az` queries are memoised — a 30-resource template fans out at most 3 calls. Unsupported types (e.g. `Microsoft.Network/networkInterfaces`) are recorded as `notChecked` with `reason=unsupportedTypeForSkuCheck`. Output: `_reports/dr/sku-availability.json`. CI hook: `SKU_AVAILABILITY_OK={true|false}`, `SKU_AVAILABILITY_SUMMARY=<avail>/<unavail>/<notChecked>`.
+
+VM substitute heuristic: from a `Standard_D<n>s_v<v>` family, suggest the next-lower size in `{64,32,16,8,4,2}`. Conservative; returns `null` when the input doesn't match the heuristic's pattern.
+
+### R5.8 / E3 — API-version compatibility check (Stage 7-DR)
+
+`scripts/dr/Test-ApiVersionCompatibility.ps1` walks every `template.json` (including nested child resources via the same nested-walk approach as `scripts/lib/ConvertForDR.psm1`), extracts `(type, apiVersion)` pairs, and queries `az provider show --namespace <ns>` (one call per namespace, memoised). Three failure modes:
+
+| Status | Meaning |
+|---|---|
+| `compatible` | apiVersion appears in the provider's supported list AND the type is available in `$DrRegion`. |
+| `incompatible` | apiVersion is NOT supported. `suggestedApiVersion` = latest GA from the supported list (preview fallback if no GA). |
+| `notAvailable` | apiVersion is supported, but `$DrRegion` is not in the type's `locations` array. |
+| `notChecked` | provider lookup failed or the type is missing from the provider's `resourceTypes`. |
+
+Region matching is whitespace-insensitive: `'North Europe'` and `'northeurope'` are treated as equivalent via a custom HashSet built with `OrdinalIgnoreCase` plus a stripped-whitespace alias.
+
+Output: `_reports/dr/api-version-compat.json`. CI hook: `API_VERSION_COMPAT_OK={true|false}`, `API_VERSION_COMPAT_SUMMARY=<compat>/<incompat>/<notAvailable>`.
+
+### R5.9 / E5 — Concurrent PR races
+
+**Decision: GitHub merge queue (option 2 from the brief).**
+
+Rationale: simpler than implementing a custom Storage-Account blob lease, and GitHub serialises PRs natively without changing any DRaaC code. The setup is documented in `docs/DOCUMENTATION.md` under "Concurrent PR safety". If the GitHub org/plan does not support merge queue, fall back to option 1 (per-RG advisory lock via blob lease in `Convert-ForDR` and `commit-drift-readme.ps1`) — that path is left as a future enhancement, not implemented in this round.
+
+### `write-job-summary.ps1` extensions
+
+Three new optional report files are now consumed by the summary writer; missing files default to zero counts so the existing test continues to pass:
+
+| File | Section in summary |
+|---|---|
+| `_reports/scan/slow-drift.json`        | `## Slow Drift (since baseline)` table |
+| `_reports/dr/sku-availability.json`    | adds rows to the existing `## DR Configuration → <region>` table; emits a `## Unavailable SKUs (top 10)` table when any are flagged |
+| `_reports/dr/api-version-compat.json`  | adds rows to the existing `## DR Configuration → <region>` table; emits a `## Incompatible API versions / region gaps (top 10)` table when any are flagged |
+
+### Bicep encoding fix
+
+`bicep/modules/dr-mysql.bicep` and `bicep/modules/dr-postgres.bicep` previously contained the U+2265 "≥" character in `@description` comments. `az bicep build` on Windows hosts (Python `cp1252` encoding) fails to encode this character. Replaced both with `>=` / `at least as large as`. Linux CI runners were unaffected; this fix unblocks `tests/bicep-build-all.ps1` on Windows.

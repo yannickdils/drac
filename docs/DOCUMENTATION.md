@@ -569,3 +569,60 @@ A: Yes. Ensure Azure CLI 2.57+, `jq` 1.6+, and PowerShell 7.2+ are installed. Th
 
 **Q: Can I use this with Terraform instead of Bicep?**  
 A: Stage 3 already extracts Terraform resource names for matching. For drift detection with Terraform state, add a script that runs `terraform show -json` and compares with the scan data.
+
+---
+
+## Round 5 follow-up — Operator notes (R5.6 – R5.9)
+
+### Stage 9 — Baseline persistence (R5.6)
+
+Run by `.github/workflows/baseline-snapshot.yml` on every push to `main`, plus a daily 03:00 UTC backstop.
+
+**One-time setup:**
+
+1. Provision a Storage Account that the workflow's federated identity (`AZURE_CLIENT_ID`) can write to. Grant the identity the `Storage Blob Data Contributor` role on the account (or a single container).
+2. Add a repository secret `DRAAC_BASELINE_STORAGE_ACCOUNT` with the Storage Account name.
+3. Apply a lifecycle-management policy to move blobs cool after 90 days and delete after 365 — see the YAML comment block at the top of `baseline-snapshot.yml` for the JSON.
+
+**During PR runs:** wire `Compare-AgainstBaseline.ps1` into `pr-compliance.yml` after the scan step (or run it on a separate scheduled cadence; the slow-drift signal does not need to be live per-PR). Output `_reports/scan/slow-drift.json` is consumed by `write-job-summary.ps1` and surfaces under the **Slow Drift (since baseline)** section in the GitHub Actions summary.
+
+**First-run behaviour:** if `latest.txt` is missing in the container, the comparator emits a slow-drift report with `summary.total = 0` and `baseline.available = false`. The next push-to-`main` snapshot becomes the seed.
+
+### Pre-deploy DR validators (R5.7 + R5.8)
+
+Run after Stage 5a (`generate-dr-config.ps1`), before Stage 7 deploy. Both scripts share the same calling convention:
+
+```powershell
+pwsh scripts/dr/Test-SkuAvailability.ps1 `
+  -DrConfigDir _reports/dr/arm `
+  -DrRegion $DR_TARGET_REGION `
+  -OutputFile _reports/dr/sku-availability.json
+
+pwsh scripts/dr/Test-ApiVersionCompatibility.ps1 `
+  -DrConfigDir _reports/dr/arm `
+  -DrRegion $DR_TARGET_REGION `
+  -OutputFile _reports/dr/api-version-compat.json
+```
+
+Both scripts default to **exit 0** even when issues are found — gating is via the GitHub Actions output (`SKU_AVAILABILITY_OK`, `API_VERSION_COMPAT_OK`). Add `-FailOnUnavailable` / `-FailOnIncompatible` only when you want a hard CI gate.
+
+The `write-job-summary.ps1` reporter renders the top 10 unavailable SKUs and the top 10 incompatible API versions into the GitHub Actions step summary, with suggested substitutes where the heuristic produces one.
+
+### Concurrent PR safety (R5.9)
+
+**Choice: GitHub merge queue.** PRs that touch DR-relevant files (any path under `bicep/regions/primary/**`, `bicep/regions/dr/**`, or `bicep/modules/**`) MUST go through merge queue. This prevents two concurrent PRs from racing `Convert-ForDR` against the same RG.
+
+To enable:
+
+1. **Branch protection rule on `main`:**
+   - Require pull request reviews
+   - Require status checks: `pr-compliance` (the PR pipeline), `dr-coverage` (Stage 3.5)
+   - **Require merge queue**
+2. **Merge queue settings:**
+   - Merge method: Squash and merge
+   - Maximum PRs to build: 1 (serial; safest for Azure deployments)
+   - Wait time: 1–5 min, depending on team velocity
+
+The `dr-deploy.yml` workflow already uses a `concurrency: { group: draac-dr-deploy, cancel-in-progress: false }` block so even without merge queue, two simultaneous merges to `main` will serialise at the deploy stage. Merge queue tightens the protection one stage earlier — at PR-merge time — preventing two PRs from both getting through their gates with stale views of the repo.
+
+**Fallback for orgs without merge queue:** wire a Storage-Account blob lease into `Convert-ForDR` and `commit-drift-readme.ps1` per the brief's option 1. Lease duration 60s, acquired before write, released after, retry-on-conflict up to 3 times. This is documented as a known fallback but not implemented in the current code; track it as a future enhancement when needed.

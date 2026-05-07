@@ -11,7 +11,7 @@
 // Notes:
 //   - Burstable-tier replicas are not supported; the param `skuTier` is
 //      restricted to GeneralPurpose / MemoryOptimized.
-//   - Storage size on the replica must be ≥ the primary at creation.
+//   - Storage size on the replica must be >= the primary at creation.
 //   - The `metadata.dr` block at the top of this file is preserved in the
 //      compiled ARM.
 // =============================================================================
@@ -57,7 +57,7 @@ param skuTier string = 'GeneralPurpose'
 ])
 param mysqlVersion string = '8.0.21'
 
-@description('Storage size in GB. Must be ≥ the primary.')
+@description('Storage size in GB. Must be at least as large as the primary.')
 @minValue(20)
 param storageSizeGB int = 128
 
