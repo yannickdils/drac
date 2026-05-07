@@ -122,11 +122,11 @@ try {
         ConvertTo-Json -Depth 5 -AsArray | Set-Content -Path (Join-Path $ScanDirB1 'all-resources.json') -Encoding UTF8
 
     # Bicep file — name present, no az CLI so regex fallback gives type=''
+    # Keep flat structure to avoid sub-properties like sku.name matching the name: regex
     @"
 resource sa 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: 'storage-prod'
   location: 'westeurope'
-  sku: { name: 'Standard_LRS' }
   kind: 'StorageV2'
 }
 "@ | Set-Content -Path (Join-Path $BicepDirB1 'storage.bicep') -Encoding UTF8

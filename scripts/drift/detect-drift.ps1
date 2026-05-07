@@ -99,10 +99,10 @@ Get-ChildItem -Path $RepoRoot -Recurse -Include "*.ps1","*.psm1" -ErrorAction Si
     }
 
 # Deduplicate by (name, type) tuple
-$UniqueCode = $CodeResources |
+$UniqueCode = @($CodeResources |
     Sort-Object   { "$($_['name'])|$($_['type'])" } |
     Group-Object  { "$($_['name'].ToLower())|$($_['type'].ToLower())" } |
-    ForEach-Object { $_.Group[0] }
+    ForEach-Object { $_.Group[0] })
 Write-Host "INFO: Extracted $($UniqueCode.Count) resource declarations from code"
 
 # ── Exclusion list (system-managed resources) ─────────────────────────────────
@@ -197,8 +197,8 @@ if (Test-Path $MatchReport) {
 }
 
 $TotalDrift    = $DriftItems.Count
-$CriticalDrift = ($DriftItems | Where-Object { $_.severity -eq "critical" }).Count
-$WarningDrift  = ($DriftItems | Where-Object { $_.severity -eq "warning"  }).Count
+$CriticalDrift = @($DriftItems | Where-Object { $_.severity -eq "critical" }).Count
+$WarningDrift  = @($DriftItems | Where-Object { $_.severity -eq "warning"  }).Count
 
 [ordered]@{
     runId        = $RunId

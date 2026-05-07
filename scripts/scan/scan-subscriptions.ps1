@@ -29,35 +29,39 @@ Write-Host "  Output:             $ScanDir"
 Write-Host "============================================================"
 
 # ── Resolve subscriptions ─────────────────────────────────────────────────────
-function Resolve-Subscriptions {
-    if ($ManagementGroup -and $ManagementGroup -ne "none") {
-        Write-Host "INFO: Querying subscriptions in management group: $ManagementGroup"
+function Resolve-Subscription {
+    param(
+        [string]$SubscriptionIdsIn = "",
+        [string]$ManagementGroupIn = ""
+    )
+    if ($ManagementGroupIn -and $ManagementGroupIn -ne "none") {
+        Write-Host "INFO: Querying subscriptions in management group: $ManagementGroupIn"
         try {
-            $mg = az account management-group show --name $ManagementGroup --expand --recurse --output json 2>$null | ConvertFrom-Json
+            $mg = az account management-group show --name $ManagementGroupIn --expand --recurse --output json 2>$null | ConvertFrom-Json
             $subs = $mg.children | Where-Object { $_.type -like "*/subscriptions" } | Select-Object -ExpandProperty name
             if ($subs) { return $subs }
         } catch { Write-Warning "Management group query failed — falling back to account list" }
     }
-    if ($SubscriptionIds -and $SubscriptionIds -ne "ALL") {
-        return ($SubscriptionIds -split ",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+    if ($SubscriptionIdsIn -and $SubscriptionIdsIn -ne "ALL") {
+        return ($SubscriptionIdsIn -split ",") | ForEach-Object { $_.Trim() } | Where-Object { $_ }
     }
     Write-Host "INFO: Fetching all accessible subscriptions"
     return (az account list --query "[?state=='Enabled'].id" --output tsv 2>$null) -split "`n" | Where-Object { $_.Trim() }
 }
 
-$Subscriptions = @(Resolve-Subscriptions)
+$Subscriptions = @(Resolve-Subscription -SubscriptionIdsIn $SubscriptionIds -ManagementGroupIn $ManagementGroup)
 $SubCount      = $Subscriptions.Count
 Write-Host "INFO: Found $SubCount subscription(s) to scan"
 $Subscriptions | Set-Content (Join-Path $ScanDir "subscriptions.txt") -Encoding UTF8
 
 # ── Paginated Resource Graph query ────────────────────────────────────────────
 function Invoke-ResourceGraphQuery {
-    param([string]$Query, [string]$OutputFile)
+    param([string]$Query, [string]$OutputFile, [string]$ApiVersionIn)
 
     $AllResults = [System.Collections.Generic.List[object]]::new()
     $SkipToken  = $null
     $Page       = 0
-    $Uri        = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=$ApiVersion"
+    $Uri        = "https://management.azure.com/providers/Microsoft.ResourceGraph/resources?api-version=$ApiVersionIn"
 
     do {
         $Page++
@@ -101,7 +105,7 @@ $Queries = [ordered]@{
 }
 
 foreach ($Key in $Queries.Keys) {
-    Invoke-ResourceGraphQuery -Query $Queries[$Key] -OutputFile (Join-Path $ScanDir "$Key.json")
+    Invoke-ResourceGraphQuery -Query $Queries[$Key] -OutputFile (Join-Path $ScanDir "$Key.json") -ApiVersionIn $ApiVersion
 }
 
 # ── Summary ───────────────────────────────────────────────────────────────────
